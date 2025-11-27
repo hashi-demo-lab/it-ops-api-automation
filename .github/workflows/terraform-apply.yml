@@ -1,0 +1,106 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
+name: Terraform Cloud API Workflow
+
+# Trigger conditions - when should this workflow run?
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Only trigger when Terraform files change
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-apply.yml'
+
+  # Allow manual triggering from GitHub UI
+  workflow_dispatch:
+
+# Environment variables available to all jobs and steps
+env:
+  # These reference GitHub secrets/variables you configured in Task 2
+  TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+  TF_WORKSPACE: "it-ops-api-automation"
+  # Set log level for debugging (OFF, ERROR, INFO, DEBUG)
+  TF_LOG: "INFO"
+
+jobs:
+  terraform-plan-apply:
+    name: "Terraform Plan & Apply"
+    runs-on: ubuntu-latest
+
+    # Set permissions for the GITHUB_TOKEN
+    permissions:
+      contents: read
+      pull-requests: write  # Allows posting plan outputs as PR comments (future enhancement)
+
+    steps:
+      # Step 1: Checkout the repository code
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Step 2: Upload configuration to Terraform Cloud
+      - name: Upload Configuration
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.3.2
+        id: upload
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          directory: "."  # Upload from repository root
+          # speculative: false (default) - this is a real run, not just a plan-only test
+
+      # Step 3: Create a run (triggers plan)
+      - name: Create Run
+        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.3.2
+        id: create-run
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          configuration_version: ${{ steps.upload.outputs.configuration_version_id }}
+          message: "Triggered by GitHub Actions - ${{ github.event.head_commit.message }}"
+          # plan_only: false (default) - allow this run to be applied
+          # is_destroy: false (default) - this is a normal apply, not a destroy
+
+      # Step 4: Apply the run
+      - name: Apply Run
+        uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
+        id: apply
+        with:
+          run: ${{ steps.create-run.outputs.run_id }}
+          comment: "Auto-applied by GitHub Actions - Run #${{ github.run_number }}"
+
+      # Step 5: Get plan output for visibility
+      - name: Get Plan Output
+        uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.3.2
+        id: plan-output
+        if: always()  # Run even if apply failed, so we can see what was planned
+        with:
+          plan: ${{ steps.create-run.outputs.plan_id }}
+
+      # Step 6: Create workflow summary
+      - name: Create Workflow Summary
+        if: always()
+        run: |
+          echo "## Terraform Cloud Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace:** \`${{ env.TF_WORKSPACE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** \`${{ steps.create-run.outputs.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Status:** ${{ steps.create-run.outputs.run_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Apply Status:** ${{ steps.apply.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # TODO: Add conditional messaging based on apply status
+          # If apply succeeded, show success message
+          # If apply failed, show failure message with plan output
+          # Consider: What information would be most helpful to see in each case?
+
+      # Step 7: Handle failures (optional)
+      # Uncomment this section if you want to fail the workflow on apply errors
+      - name: Check Apply Status
+        if: steps.apply.outputs.status != 'Success'
+        run: |
+          echo "::error::Terraform apply failed with status: ${{ steps.apply.outputs.status }}"
+          exit 1
