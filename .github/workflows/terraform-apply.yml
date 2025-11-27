@@ -5,7 +5,6 @@ name: Terraform Cloud API Workflow
 
 # Trigger conditions - when should this workflow run?
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
