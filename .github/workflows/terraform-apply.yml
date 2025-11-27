@@ -57,7 +57,12 @@ jobs:
         with:
           workspace: ${{ env.TF_WORKSPACE }}
           configuration_version: ${{ steps.upload.outputs.configuration_version_id }}
-          message: "Triggered by GitHub Actions - ${{ github.event.head_commit.message }}"
+          message: |
+            Triggered by @${{ github.actor }} via ${{ github.event_name }}
+
+            ${{ github.event.head_commit.message || 'Manual workflow dispatch' }}
+
+            Commit: ${{ github.sha }}
           # plan_only: false (default) - allow this run to be applied
           # is_destroy: false (default) - this is a normal apply, not a destroy
 
@@ -67,7 +72,10 @@ jobs:
         id: apply
         with:
           run: ${{ steps.create-run.outputs.run_id }}
-          comment: "Auto-applied by GitHub Actions - Run #${{ github.run_number }}"
+          comment: |
+            Auto-applied by @${{ github.actor }} via GitHub Actions (Run #${{ github.run_number }})
+
+            Commit: ${{ github.event.head_commit.message || 'Manual workflow dispatch' }}
 
       # Step 5: Get plan output for visibility
       - name: Get Plan Output
@@ -81,21 +89,93 @@ jobs:
       - name: Create Workflow Summary
         if: always()
         run: |
-          echo "## Terraform Cloud Run Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Workspace:** \`${{ env.TF_WORKSPACE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Run ID:** \`${{ steps.create-run.outputs.run_id }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Run Status:** ${{ steps.create-run.outputs.run_status }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Apply Status:** ${{ steps.apply.outputs.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Links" >> $GITHUB_STEP_SUMMARY
-          echo "- [View Run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "# 🚀 Terraform Cloud API Workflow" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # TODO: Add conditional messaging based on apply status
-          # If apply succeeded, show success message
-          # If apply failed, show failure message with plan output
-          # Consider: What information would be most helpful to see in each case?
+          # Status badge at the top
+          if [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
+            echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.outputs.status }}" == "Error" ]; then
+            echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ Deployment Status: ${{ steps.apply.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Workflow metadata
+          echo "### 📋 Run Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Organization** | \`${{ env.TF_CLOUD_ORGANIZATION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered By** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Event** | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workflow Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Terraform Cloud run info
+          echo "### ☁️ Terraform Cloud Run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | \`${{ steps.create-run.outputs.run_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Plan ID** | \`${{ steps.create-run.outputs.plan_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Configuration Version** | \`${{ steps.upload.outputs.configuration_version_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Plan Status** | \`${{ steps.create-run.outputs.plan_status }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Apply Status** | \`${{ steps.apply.outputs.status }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Plan changes summary
+          echo "### 📊 Infrastructure Changes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Change Type | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ➕ Resources to Add | ${{ steps.plan-output.outputs.add }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔄 Resources to Change | ${{ steps.plan-output.outputs.change }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ➖ Resources to Destroy | ${{ steps.plan-output.outputs.destroy }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Links section
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 [View Run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 [Workspace Overview](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📝 [Workspace Variables](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/variables)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚙️ [Workspace Settings](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/settings/general)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Conditional success/failure message
+          if [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
+            echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure changes have been successfully applied! The Terraform configuration was:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 **Uploaded** to Terraform Cloud as configuration version \`${{ steps.upload.outputs.configuration_version_id }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 **Planned** by Terraform Cloud (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. ✅ **Applied** successfully with all changes committed to your infrastructure" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **API-Driven Workflow**: This deployment used Terraform Cloud's API, not the CLI. All execution happened in TFC's secure environment." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Action Required" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The apply step encountered an issue. Please review the following:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check the [run details in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+            echo "2. Review the plan output above for any errors" >> $GITHUB_STEP_SUMMARY
+            echo "3. Verify workspace variables and provider credentials" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Status**: \`${{ steps.apply.outputs.status }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by [GitHub Actions](${{ github.server_url }}/${{ github.repository }}) using [tfc-workflows-github](https://github.com/hashicorp/tfc-workflows-github)*" >> $GITHUB_STEP_SUMMARY
 
       # Step 7: Handle failures (optional)
       # Uncomment this section if you want to fail the workflow on apply errors
