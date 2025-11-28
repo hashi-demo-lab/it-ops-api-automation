@@ -224,7 +224,74 @@ jobs:
             echo "requires_override=false" >> $GITHUB_OUTPUT
           fi
 
-      # Step 5: Apply the run (only if there are changes)
+      # Step 5: Wait for policy override if required
+      - name: Wait for Policy Override
+        id: wait-for-override
+        if: steps.policy-override.outputs.requires_override == 'true'
+        run: |
+          echo "⏸️ Run is awaiting policy override..."
+          echo ""
+          echo "🔗 Override in TFC: ${{ steps.create-run.outputs.run_link }}"
+          echo ""
+          echo "This workflow will wait up to 1 hour for you to:"
+          echo "  1. Review the policy failure in TFC UI"
+          echo "  2. Click 'Override & Continue' (if soft-mandatory)"
+          echo "  3. Provide justification"
+          echo ""
+          echo "The workflow will automatically proceed after override."
+          echo "If not overridden within 1 hour, this step will timeout."
+          echo ""
+
+          # Poll TFC API for run status change
+          MAX_WAIT=3600  # 1 hour in seconds
+          POLL_INTERVAL=30  # Check every 30 seconds
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Get current run status
+            RUN_DATA=$(curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2/runs/${{ steps.create-run.outputs.run_id }}")
+
+            CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
+
+            echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS"
+
+            # Check if override was applied or run can proceed
+            if [[ "$CURRENT_STATUS" == "policy_override" ]] || \
+               [[ "$CURRENT_STATUS" == "apply_queued" ]] || \
+               [[ "$CURRENT_STATUS" == "applying" ]] || \
+               [[ "$CURRENT_STATUS" == "applied" ]]; then
+              echo ""
+              echo "✅ Policy override detected! Run status changed to: $CURRENT_STATUS"
+              echo "Proceeding with workflow..."
+              exit 0
+            fi
+
+            # Check if run ended in a terminal state (failed, discarded, etc.)
+            if [[ "$CURRENT_STATUS" == "discarded" ]] || \
+               [[ "$CURRENT_STATUS" == "errored" ]] || \
+               [[ "$CURRENT_STATUS" == "canceled" ]] || \
+               [[ "$CURRENT_STATUS" == "force_canceled" ]]; then
+              echo ""
+              echo "❌ Run ended with terminal status: $CURRENT_STATUS"
+              echo "Cannot proceed - workflow will fail"
+              exit 1
+            fi
+
+            # Still waiting...
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          # Timeout reached
+          echo ""
+          echo "::error::⏱️ Timeout: No policy override detected after 1 hour"
+          echo "::error::Please override the policy in TFC or update your code to comply"
+          exit 1
+
+      # Step 6: Apply the run (only if there are changes)
       - name: Apply Run
         uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
         id: apply
@@ -235,15 +302,17 @@ jobs:
             Auto-applied by @${{ github.actor }} via GitHub Actions (Run #${{ github.run_number }})
 
             Commit: ${{ github.event.head_commit.message || 'Manual workflow dispatch' }}
+        # Note: If policy override was required, the previous step waited for it
+        # This step will now apply the run (or detect it's already been applied)
 
-      # Step 5b: Skip message when no changes
+      # Step 7: Skip message when no changes
       - name: No Changes Detected
         if: steps.plan-output.outputs.add == '0' && steps.plan-output.outputs.change == '0' && steps.plan-output.outputs.destroy == '0'
         run: |
           echo "::notice::No infrastructure changes detected. Skipping apply step."
           echo "Plan showed 0 resources to add, change, or destroy."
 
-      # Step 6: Create workflow summary
+      # Step 8: Create workflow summary
       - name: Create Workflow Summary
         if: always()
         run: |
@@ -341,21 +410,19 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Conditional success/failure message
-          if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
-            echo "### 🚨 Action Required: Policy Override Needed" >> $GITHUB_STEP_SUMMARY
+          # Check if override wait step failed (timeout)
+          OVERRIDE_WAIT_CONCLUSION="${{ steps.wait-for-override.conclusion }}"
+
+          if [[ "$OVERRIDE_WAIT_CONCLUSION" == "failure" ]]; then
+            echo "### ⏱️ Policy Override Timeout" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The run has been paused due to **mandatory policy failure(s)**. If this is a **soft-mandatory** policy, you can override it:" >> $GITHUB_STEP_SUMMARY
+            echo "The workflow waited 1 hour for a policy override but none was provided." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Override Steps:**" >> $GITHUB_STEP_SUMMARY
-            echo "1. 🔗 Open the [run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
-            echo "2. 📋 Review the policy failure details" >> $GITHUB_STEP_SUMMARY
-            echo "3. ✅ Click **\"Override & Continue\"** button (if available)" >> $GITHUB_STEP_SUMMARY
-            echo "4. 📝 Provide justification for the override" >> $GITHUB_STEP_SUMMARY
-            echo "5. ⏭️ The apply will automatically proceed after override" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> ⚠️ **Note**: If the policy is **hard-mandatory**, you cannot override it. You must fix the code to comply with the policy." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> ⏰ **Timeout**: The workflow will wait up to **1 hour** for override. After that, it will fail with a timeout error." >> $GITHUB_STEP_SUMMARY
+            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 🔗 Review the [policy failure in TFC](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+            echo "2. Either:" >> $GITHUB_STEP_SUMMARY
+            echo "   - Override the policy manually in TFC and trigger apply" >> $GITHUB_STEP_SUMMARY
+            echo "   - Fix your code to comply with the policy and re-run" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -393,9 +460,18 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "*Generated by [GitHub Actions](${{ github.server_url }}/${{ github.repository }}) using [tfc-workflows-github](https://github.com/hashicorp/tfc-workflows-github)*" >> $GITHUB_STEP_SUMMARY
 
-      # Step 7: Handle failures
-      - name: Check Apply Status
-        if: steps.apply.conclusion == 'failure'
+      # Step 9: Handle failures
+      - name: Check Workflow Status
+        if: steps.apply.conclusion == 'failure' || steps.wait-for-override.conclusion == 'failure'
         run: |
-          echo "::error::Terraform apply failed with status: ${{ steps.apply.outputs.status }}"
-          exit 1
+          # Check if policy override wait failed (timeout)
+          if [[ "${{ steps.wait-for-override.conclusion }}" == "failure" ]]; then
+            echo "::error::Policy override timeout - workflow failed waiting for override"
+            exit 1
+          fi
+
+          # Check if apply failed
+          if [[ "${{ steps.apply.conclusion }}" == "failure" ]]; then
+            echo "::error::Terraform apply failed with status: ${{ steps.apply.outputs.status }}"
+            exit 1
+          fi
