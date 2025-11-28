@@ -258,10 +258,9 @@ jobs:
 
             echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS"
 
-            # Check if override was applied or run can proceed
+            # Check if override was applied and run can proceed with API apply
             if [[ "$CURRENT_STATUS" == "policy_override" ]] || \
-               [[ "$CURRENT_STATUS" == "apply_queued" ]] || \
-               [[ "$CURRENT_STATUS" == "applying" ]]; then
+               [[ "$CURRENT_STATUS" == "apply_queued" ]]; then
               echo ""
               echo "✅ Policy override detected! Run status changed to: $CURRENT_STATUS"
               echo "Proceeding with workflow - apply will be triggered via API..."
@@ -270,11 +269,12 @@ jobs:
               exit 0
             fi
 
-            # Check if run was already manually applied in TFC UI
-            if [[ "$CURRENT_STATUS" == "applied" ]]; then
+            # Check if run is already being applied or was applied in TFC UI
+            if [[ "$CURRENT_STATUS" == "applying" ]] || \
+               [[ "$CURRENT_STATUS" == "applied" ]]; then
               echo ""
-              echo "✅ Run was manually applied in TFC UI after policy override!"
-              echo "Apply has already completed - skipping apply-run step"
+              echo "✅ Apply already initiated/completed in TFC UI! Status: $CURRENT_STATUS"
+              echo "Skipping apply-run step - apply is already in progress or done"
               echo "override_detected=true" >> $GITHUB_OUTPUT
               echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
               exit 0
@@ -323,9 +323,9 @@ jobs:
       - name: Manual Apply Detected
         if: steps.wait-for-override.outputs.manual_apply_completed == 'true'
         run: |
-          echo "::notice::✅ Apply was completed manually in TFC UI"
-          echo "The run was applied in Terraform Cloud after policy override."
-          echo "Skipping apply-run step since the apply is already complete."
+          echo "::notice::✅ Apply was initiated/completed manually in TFC UI"
+          echo "The run is already being applied or has been applied in Terraform Cloud."
+          echo "Skipping apply-run API call to avoid conflict."
           echo ""
           echo "🔗 View results: ${{ steps.create-run.outputs.run_link }}"
 
@@ -456,17 +456,17 @@ jobs:
           elif [[ "$MANUAL_APPLY" == "true" ]]; then
             echo "### ✅ Deployment Successful (Manual Apply)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Your infrastructure changes were successfully applied **manually in Terraform Cloud UI** after policy override!" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure changes were applied **manually in Terraform Cloud UI** after policy override!" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**What Happened:**" >> $GITHUB_STEP_SUMMARY
             echo "1. 📤 Configuration uploaded to Terraform Cloud" >> $GITHUB_STEP_SUMMARY
             echo "2. 📋 Plan completed (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
             echo "3. 🛡️ Sentinel policy failed (soft-mandatory)" >> $GITHUB_STEP_SUMMARY
             echo "4. ⏸️ Workflow waited for policy override" >> $GITHUB_STEP_SUMMARY
-            echo "5. ✅ You overrode the policy and confirmed apply in TFC UI" >> $GITHUB_STEP_SUMMARY
-            echo "6. 🎉 Apply completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "5. ✅ You overrode the policy and triggered apply in TFC UI" >> $GITHUB_STEP_SUMMARY
+            echo "6. 🎉 Apply completed (or is completing) in TFC" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> 💡 **Manual Confirmation**: When you override a policy in TFC, you can choose to apply immediately or confirm separately. You chose to confirm the apply manually in the UI." >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Manual Workflow**: The workflow detected that apply was initiated in TFC UI and skipped the API apply call to avoid conflicts." >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
