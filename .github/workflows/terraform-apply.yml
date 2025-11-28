@@ -161,6 +161,44 @@ jobs:
 
           echo "::endgroup::"
 
+      # Step 4d: Check for policy override requirements
+      - name: Check Policy Override Status
+        if: always()
+        id: policy-override
+        continue-on-error: true
+        run: |
+          # Check if any mandatory policies failed
+          MANDATORY_FAILED=${{ steps.policy-checks.outputs.policies_mandatory_failed }}
+
+          if [ "$MANDATORY_FAILED" -gt 0 ]; then
+            echo "::warning::⚠️ $MANDATORY_FAILED mandatory policy failure(s) detected"
+            echo "::warning::🔗 Override in TFC: ${{ steps.create-run.outputs.run_link }}"
+            echo "::warning::⏰ Apply step will wait up to 1 hour for manual override"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🚨 MANDATORY POLICY FAILURE - MANUAL OVERRIDE REQUIRED"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "📊 Failed Policies: $MANDATORY_FAILED"
+            echo "🔗 TFC Run URL: ${{ steps.create-run.outputs.run_link }}"
+            echo ""
+            echo "⏳ NEXT STEPS:"
+            echo "   1. Review policy failures in TFC UI"
+            echo "   2. Click 'Override & Continue' button (if soft-mandatory)"
+            echo "   3. Provide justification for override"
+            echo "   4. Workflow will automatically continue after override"
+            echo ""
+            echo "⚠️  If not overridden within $TF_MAX_TIMEOUT (default: 1h),"
+            echo "   the apply step will timeout and workflow will fail."
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "requires_override=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ No mandatory policy failures - proceeding with apply"
+            echo "requires_override=false" >> $GITHUB_OUTPUT
+          fi
+
       # Step 5: Apply the run (only if there are changes)
       - name: Apply Run
         uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
@@ -253,7 +291,13 @@ jobs:
             echo "| ❌ **Errored** | ${{ steps.policy-checks.outputs.policies_errored }} |" >> $GITHUB_STEP_SUMMARY
             echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> 💡 **Policy Governance**: Sentinel policies validate configuration compliance even when no infrastructure changes are detected. View detailed policy results in the Terraform Cloud run." >> $GITHUB_STEP_SUMMARY
+
+            # Show warning if mandatory policies failed
+            if [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
+              echo "> ⚠️ **Action Required**: ${{ steps.policy-checks.outputs.policies_mandatory_failed }} mandatory policies failed. If these are **soft-mandatory** policies, you can override them in the [Terraform Cloud UI](${{ steps.create-run.outputs.run_link }}). If they are **hard-mandatory**, you must fix the code to comply." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "> 💡 **Policy Governance**: Sentinel policies validate configuration compliance even when no infrastructure changes are detected. View detailed policy results in the Terraform Cloud run." >> $GITHUB_STEP_SUMMARY
+            fi
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
