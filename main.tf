@@ -17,21 +17,21 @@ terraform {
 }
 
 # A simple random pet resource to test deployments
-resource "random_pet" "example" {
+resource "random_pet" "example_pet" {
   length    = 3
   separator = "-"
 }
 
-resource "random_id" "example_id" {
-  byte_length = 4
-}
-
 output "pet_name" {
   description = "The generated random pet name"
-  value       = random_pet.example.id
+  value       = random_pet.example_pet.id
 }
 
-output "example_id" {
-  description = "The generated random ID"
-  value       = random_id.example_id.hex
-}
+# resource "random_id" "example_id" {
+#   byte_length = 4
+# }
+
+# output "example_id" {
+#   description = "The generated random ID"
+#   value       = random_id.example_id.hex
+# }
