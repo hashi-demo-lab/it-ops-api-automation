@@ -261,11 +261,22 @@ jobs:
             # Check if override was applied or run can proceed
             if [[ "$CURRENT_STATUS" == "policy_override" ]] || \
                [[ "$CURRENT_STATUS" == "apply_queued" ]] || \
-               [[ "$CURRENT_STATUS" == "applying" ]] || \
-               [[ "$CURRENT_STATUS" == "applied" ]]; then
+               [[ "$CURRENT_STATUS" == "applying" ]]; then
               echo ""
               echo "✅ Policy override detected! Run status changed to: $CURRENT_STATUS"
-              echo "Proceeding with workflow..."
+              echo "Proceeding with workflow - apply will be triggered via API..."
+              echo "override_detected=true" >> $GITHUB_OUTPUT
+              echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # Check if run was already manually applied in TFC UI
+            if [[ "$CURRENT_STATUS" == "applied" ]]; then
+              echo ""
+              echo "✅ Run was manually applied in TFC UI after policy override!"
+              echo "Apply has already completed - skipping apply-run step"
+              echo "override_detected=true" >> $GITHUB_OUTPUT
+              echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
               exit 0
             fi
 
@@ -291,19 +302,32 @@ jobs:
           echo "::error::Please override the policy in TFC or update your code to comply"
           exit 1
 
-      # Step 6: Apply the run (only if there are changes)
+      # Step 6: Apply the run (only if there are changes and not already applied manually)
       - name: Apply Run
         uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
         id: apply
-        if: steps.plan-output.outputs.add != '0' || steps.plan-output.outputs.change != '0' || steps.plan-output.outputs.destroy != '0'
+        if: |
+          (steps.plan-output.outputs.add != '0' || steps.plan-output.outputs.change != '0' || steps.plan-output.outputs.destroy != '0') &&
+          steps.wait-for-override.outputs.manual_apply_completed != 'true'
         with:
           run: ${{ steps.create-run.outputs.run_id }}
           comment: |
             Auto-applied by @${{ github.actor }} via GitHub Actions (Run #${{ github.run_number }})
 
             Commit: ${{ github.event.head_commit.message || 'Manual workflow dispatch' }}
-        # Note: If policy override was required, the previous step waited for it
-        # This step will now apply the run (or detect it's already been applied)
+        # Note: This step is skipped if:
+        #   1. No infrastructure changes detected, OR
+        #   2. Run was already manually applied in TFC UI after policy override
+
+      # Step 6b: Manual apply detected message
+      - name: Manual Apply Detected
+        if: steps.wait-for-override.outputs.manual_apply_completed == 'true'
+        run: |
+          echo "::notice::✅ Apply was completed manually in TFC UI"
+          echo "The run was applied in Terraform Cloud after policy override."
+          echo "Skipping apply-run step since the apply is already complete."
+          echo ""
+          echo "🔗 View results: ${{ steps.create-run.outputs.run_link }}"
 
       # Step 7: Skip message when no changes
       - name: No Changes Detected
@@ -321,8 +345,11 @@ jobs:
 
           # Status badge at the top
           RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+          MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
 
-          if [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
+          if [[ "$MANUAL_APPLY" == "true" ]]; then
+            echo "## ✅ Deployment Successful (Manual)" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
             echo "## ✨ No Changes Required" >> $GITHUB_STEP_SUMMARY
@@ -413,6 +440,9 @@ jobs:
           # Check if override wait step failed (timeout)
           OVERRIDE_WAIT_CONCLUSION="${{ steps.wait-for-override.conclusion }}"
 
+          # Check if manual apply was completed in TFC
+          MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
+
           if [[ "$OVERRIDE_WAIT_CONCLUSION" == "failure" ]]; then
             echo "### ⏱️ Policy Override Timeout" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -423,6 +453,20 @@ jobs:
             echo "2. Either:" >> $GITHUB_STEP_SUMMARY
             echo "   - Override the policy manually in TFC and trigger apply" >> $GITHUB_STEP_SUMMARY
             echo "   - Fix your code to comply with the policy and re-run" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$MANUAL_APPLY" == "true" ]]; then
+            echo "### ✅ Deployment Successful (Manual Apply)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure changes were successfully applied **manually in Terraform Cloud UI** after policy override!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**What Happened:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 Configuration uploaded to Terraform Cloud" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 Plan completed (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. 🛡️ Sentinel policy failed (soft-mandatory)" >> $GITHUB_STEP_SUMMARY
+            echo "4. ⏸️ Workflow waited for policy override" >> $GITHUB_STEP_SUMMARY
+            echo "5. ✅ You overrode the policy and confirmed apply in TFC UI" >> $GITHUB_STEP_SUMMARY
+            echo "6. 🎉 Apply completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Manual Confirmation**: When you override a policy in TFC, you can choose to apply immediately or confirm separately. You chose to confirm the apply manually in the UI." >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
