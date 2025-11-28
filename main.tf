@@ -16,6 +16,11 @@ terraform {
   # The workspace configuration exists in TFC, not in code
 }
 
+variable "bu_projects" {
+  type = string
+  default = ""
+}
+
 # A simple random pet resource to test deployments
 resource "random_pet" "example_pet" {
   length    = 3
