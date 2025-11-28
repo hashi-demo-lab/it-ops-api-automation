@@ -275,8 +275,30 @@ jobs:
               echo ""
               echo "✅ Policy override detected! Run status: $CURRENT_STATUS"
               echo "Override complete - workflow will now trigger apply via API..."
-              echo "override_detected=true" >> $GITHUB_OUTPUT
-              echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
+
+              # Fetch policy override details (who overrode and their comment)
+              OVERRIDE_BY=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
+              OVERRIDE_AT=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override"."overridden-at" // ""')
+              OVERRIDE_COMMENT=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override".comment // "No comment provided"')
+
+              echo ""
+              echo "📋 Override Details:"
+              echo "   Overridden by: $OVERRIDE_BY"
+              if [[ -n "$OVERRIDE_AT" && "$OVERRIDE_AT" != "null" ]]; then
+                echo "   Overridden at: $OVERRIDE_AT"
+              fi
+              echo "   Justification: $OVERRIDE_COMMENT"
+
+              # Save override details for summary
+              {
+                echo "override_detected=true"
+                echo "manual_apply_completed=false"
+                echo "override_by=$OVERRIDE_BY"
+                echo "override_comment<<EOF"
+                echo "$OVERRIDE_COMMENT"
+                echo "EOF"
+              } >> $GITHUB_OUTPUT
+
               exit 0
             fi
 
@@ -298,8 +320,26 @@ jobs:
               echo "⚠️  Apply was manually triggered in TFC UI (status: $CURRENT_STATUS)"
               echo "For proper workflow control, after override, let the GitHub Actions workflow trigger the apply."
               echo "Skipping apply-run step since apply is already in progress/done."
-              echo "override_detected=true" >> $GITHUB_OUTPUT
-              echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
+
+              # Fetch policy override details
+              OVERRIDE_BY=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
+              OVERRIDE_COMMENT=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override".comment // "No comment provided"')
+
+              echo ""
+              echo "📋 Override Details:"
+              echo "   Overridden by: $OVERRIDE_BY"
+              echo "   Justification: $OVERRIDE_COMMENT"
+
+              # Save override details for summary
+              {
+                echo "override_detected=true"
+                echo "manual_apply_completed=true"
+                echo "override_by=$OVERRIDE_BY"
+                echo "override_comment<<EOF"
+                echo "$OVERRIDE_COMMENT"
+                echo "EOF"
+              } >> $GITHUB_OUTPUT
+
               exit 0
             fi
 
@@ -450,8 +490,18 @@ jobs:
             echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
 
-            # Show warning if mandatory policies failed
-            if [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
+            # Show warning or override details if mandatory policies failed
+            if [ "${{ steps.wait-for-override.outputs.override_detected }}" == "true" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "#### 🛡️ Policy Override Details" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| **Overridden By** | \`${{ steps.wait-for-override.outputs.override_by }}\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Justification** | ${{ steps.wait-for-override.outputs.override_comment }} |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> 📝 **Audit Trail**: Policy override decision recorded. All overrides are logged in Terraform Cloud for compliance review." >> $GITHUB_STEP_SUMMARY
+            elif [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
               echo "> ⚠️ **Action Required**: ${{ steps.policy-checks.outputs.policies_mandatory_failed }} mandatory policies failed. If these are **soft-mandatory** policies, you can override them in the [Terraform Cloud UI](${{ steps.create-run.outputs.run_link }}). If they are **hard-mandatory**, you must fix the code to comply." >> $GITHUB_STEP_SUMMARY
             else
               echo "> 💡 **Policy Governance**: Sentinel policies validate configuration compliance even when no infrastructure changes are detected. View detailed policy results in the Terraform Cloud run." >> $GITHUB_STEP_SUMMARY
