@@ -233,13 +233,22 @@ jobs:
           echo ""
           echo "🔗 Override in TFC: ${{ steps.create-run.outputs.run_link }}"
           echo ""
-          echo "This workflow will wait up to 1 hour for you to:"
-          echo "  1. Review the policy failure in TFC UI"
-          echo "  2. Click 'Override & Continue' (if soft-mandatory)"
-          echo "  3. Provide justification"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋 POLICY OVERRIDE WORKFLOW"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "The workflow will automatically proceed after override."
-          echo "If not overridden within 1 hour, this step will timeout."
+          echo "This workflow will wait up to 1 hour for you to:"
+          echo "  1. 🔗 Open the run in Terraform Cloud (link above)"
+          echo "  2. 📋 Review the policy failure details"
+          echo "  3. ✅ Click 'Override & Continue' button"
+          echo "  4. 📝 Provide justification for the override"
+          echo "  5. ⏸️  DO NOT click 'Confirm & Apply' in TFC"
+          echo ""
+          echo "After you override the policy, this workflow will"
+          echo "automatically trigger the apply via API (maintaining"
+          echo "the GitOps workflow and audit trail in GitHub Actions)."
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
 
           # Poll TFC API for run status change
@@ -258,23 +267,37 @@ jobs:
 
             echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS"
 
-            # Check if override was applied and run can proceed with API apply
+            # Check if override was applied - run is ready for API apply
+            # We want to catch it at "policy_override" or "post_plan_completed" status
+            # Before it auto-proceeds to applying
             if [[ "$CURRENT_STATUS" == "policy_override" ]] || \
-               [[ "$CURRENT_STATUS" == "apply_queued" ]]; then
+               [[ "$CURRENT_STATUS" == "post_plan_completed" ]]; then
               echo ""
-              echo "✅ Policy override detected! Run status changed to: $CURRENT_STATUS"
-              echo "Proceeding with workflow - apply will be triggered via API..."
+              echo "✅ Policy override detected! Run status: $CURRENT_STATUS"
+              echo "Override complete - workflow will now trigger apply via API..."
+              echo "override_detected=true" >> $GITHUB_OUTPUT
+              echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # Check if run proceeded to apply queue (auto-apply workspace)
+            if [[ "$CURRENT_STATUS" == "apply_queued" ]]; then
+              echo ""
+              echo "✅ Override complete and run queued for apply"
+              echo "Apply will be triggered via API..."
               echo "override_detected=true" >> $GITHUB_OUTPUT
               echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
               exit 0
             fi
 
             # Check if run is already being applied or was applied in TFC UI
+            # This means you manually clicked "Confirm & Apply" in TFC instead of letting the workflow do it
             if [[ "$CURRENT_STATUS" == "applying" ]] || \
                [[ "$CURRENT_STATUS" == "applied" ]]; then
               echo ""
-              echo "✅ Apply already initiated/completed in TFC UI! Status: $CURRENT_STATUS"
-              echo "Skipping apply-run step - apply is already in progress or done"
+              echo "⚠️  Apply was manually triggered in TFC UI (status: $CURRENT_STATUS)"
+              echo "For proper workflow control, after override, let the GitHub Actions workflow trigger the apply."
+              echo "Skipping apply-run step since apply is already in progress/done."
               echo "override_detected=true" >> $GITHUB_OUTPUT
               echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
               exit 0
@@ -323,9 +346,19 @@ jobs:
       - name: Manual Apply Detected
         if: steps.wait-for-override.outputs.manual_apply_completed == 'true'
         run: |
-          echo "::notice::✅ Apply was initiated/completed manually in TFC UI"
+          echo "::warning::⚠️ Apply was triggered manually in TFC UI"
+          echo ""
           echo "The run is already being applied or has been applied in Terraform Cloud."
           echo "Skipping apply-run API call to avoid conflict."
+          echo ""
+          echo "💡 Best Practice: After overriding a policy in TFC, wait for this"
+          echo "   workflow to trigger the apply via API. This maintains the full"
+          echo "   GitOps audit trail in GitHub Actions."
+          echo ""
+          echo "   Expected workflow:"
+          echo "   1. Override policy in TFC (provide justification)"
+          echo "   2. DO NOT click 'Confirm & Apply' in TFC"
+          echo "   3. Let this workflow automatically trigger the apply"
           echo ""
           echo "🔗 View results: ${{ steps.create-run.outputs.run_link }}"
 
@@ -348,7 +381,7 @@ jobs:
           MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
 
           if [[ "$MANUAL_APPLY" == "true" ]]; then
-            echo "## ✅ Deployment Successful (Manual)" >> $GITHUB_STEP_SUMMARY
+            echo "## ⚠️ Applied Manually in TFC" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
@@ -454,19 +487,20 @@ jobs:
             echo "   - Override the policy manually in TFC and trigger apply" >> $GITHUB_STEP_SUMMARY
             echo "   - Fix your code to comply with the policy and re-run" >> $GITHUB_STEP_SUMMARY
           elif [[ "$MANUAL_APPLY" == "true" ]]; then
-            echo "### ✅ Deployment Successful (Manual Apply)" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚠️ Deployment Successful (Manual Apply in TFC)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Your infrastructure changes were applied **manually in Terraform Cloud UI** after policy override!" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure changes were applied, but the apply was triggered **manually in TFC UI** instead of via the workflow." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**What Happened:**" >> $GITHUB_STEP_SUMMARY
             echo "1. 📤 Configuration uploaded to Terraform Cloud" >> $GITHUB_STEP_SUMMARY
             echo "2. 📋 Plan completed (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
             echo "3. 🛡️ Sentinel policy failed (soft-mandatory)" >> $GITHUB_STEP_SUMMARY
             echo "4. ⏸️ Workflow waited for policy override" >> $GITHUB_STEP_SUMMARY
-            echo "5. ✅ You overrode the policy and triggered apply in TFC UI" >> $GITHUB_STEP_SUMMARY
-            echo "6. 🎉 Apply completed (or is completing) in TFC" >> $GITHUB_STEP_SUMMARY
+            echo "5. ✅ You overrode the policy in TFC" >> $GITHUB_STEP_SUMMARY
+            echo "6. ⚠️ You also clicked \"Confirm & Apply\" in TFC (should wait for workflow)" >> $GITHUB_STEP_SUMMARY
+            echo "7. ⏭️ Workflow skipped API apply to avoid conflict" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> 💡 **Manual Workflow**: The workflow detected that apply was initiated in TFC UI and skipped the API apply call to avoid conflicts." >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Best Practice**: After overriding a policy, let the workflow trigger the apply via API to maintain full GitOps audit trail in GitHub Actions. Only override the policy in TFC, then let the workflow proceed automatically." >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
