@@ -113,7 +113,9 @@ jobs:
           # Step 2: For each task stage with policies, get the policy evaluations
           TOTAL_EVALUATIONS=0
           TOTAL_PASSED=0
-          TOTAL_FAILED=0
+          TOTAL_ADVISORY_FAILED=0
+          TOTAL_MANDATORY_FAILED=0
+          TOTAL_ERRORED=0
 
           for STAGE_ID in $POLICY_STAGE_IDS; do
             POLICY_EVALS=$(curl -s \
@@ -124,22 +126,27 @@ jobs:
             # Parse evaluation results
             echo "$POLICY_EVALS" | jq -r '.data[] | "📋 Policy Evaluation: \(.id)\n   Status: \(.attributes.status)\n   Policy Engine: \(.attributes."policy-kind")\n   Results:\n     • Passed: \(.attributes."result-count".passed)\n     • Advisory Failed: \(.attributes."result-count"."advisory-failed")\n     • Mandatory Failed: \(.attributes."result-count"."mandatory-failed")\n     • Errored: \(.attributes."result-count".errored)\n"'
 
-            # Aggregate counts
+            # Aggregate counts separately by type
             EVAL_COUNT=$(echo "$POLICY_EVALS" | jq -r '.data | length')
             PASSED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count".passed] | add // 0')
             ADV_FAILED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count"."advisory-failed"] | add // 0')
             MAND_FAILED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count"."mandatory-failed"] | add // 0')
+            ERRORED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count".errored] | add // 0')
 
             TOTAL_EVALUATIONS=$((TOTAL_EVALUATIONS + EVAL_COUNT))
             TOTAL_PASSED=$((TOTAL_PASSED + PASSED))
-            TOTAL_FAILED=$((TOTAL_FAILED + ADV_FAILED + MAND_FAILED))
+            TOTAL_ADVISORY_FAILED=$((TOTAL_ADVISORY_FAILED + ADV_FAILED))
+            TOTAL_MANDATORY_FAILED=$((TOTAL_MANDATORY_FAILED + MAND_FAILED))
+            TOTAL_ERRORED=$((TOTAL_ERRORED + ERRORED))
           done
 
           echo ""
           echo "📊 Summary:"
           echo "   Total Policy Evaluations: $TOTAL_EVALUATIONS"
-          echo "   Total Policies Passed: $TOTAL_PASSED"
-          echo "   Total Policies Failed: $TOTAL_FAILED"
+          echo "   Policies Passed: $TOTAL_PASSED"
+          echo "   Advisory Failed: $TOTAL_ADVISORY_FAILED"
+          echo "   Mandatory Failed: $TOTAL_MANDATORY_FAILED"
+          echo "   Errored: $TOTAL_ERRORED"
           echo ""
           echo "ℹ️  Detailed policy results available in Terraform Cloud"
           echo "   View at: ${{ steps.create-run.outputs.run_link }}"
@@ -148,7 +155,9 @@ jobs:
           echo "policy_count=$TOTAL_EVALUATIONS" >> $GITHUB_OUTPUT
           echo "policies_enabled=true" >> $GITHUB_OUTPUT
           echo "policies_passed=$TOTAL_PASSED" >> $GITHUB_OUTPUT
-          echo "policies_failed=$TOTAL_FAILED" >> $GITHUB_OUTPUT
+          echo "policies_advisory_failed=$TOTAL_ADVISORY_FAILED" >> $GITHUB_OUTPUT
+          echo "policies_mandatory_failed=$TOTAL_MANDATORY_FAILED" >> $GITHUB_OUTPUT
+          echo "policies_errored=$TOTAL_ERRORED" >> $GITHUB_OUTPUT
 
           echo "::endgroup::"
 
@@ -236,12 +245,13 @@ jobs:
           if [ "${{ steps.policy-checks.outputs.policies_enabled }}" == "true" ]; then
             echo "### 🛡️ Sentinel Policy Evaluations" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
-            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| ✅ **Policies Passed** | ${{ steps.policy-checks.outputs.policies_passed }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| ⚠️ **Policies Failed (Advisory)** | ${{ steps.policy-checks.outputs.policies_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Result Type | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ **Passed** | ${{ steps.policy-checks.outputs.policies_passed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚠️ **Failed (Advisory)** | ${{ steps.policy-checks.outputs.policies_advisory_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🚫 **Failed (Mandatory)** | ${{ steps.policy-checks.outputs.policies_mandatory_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ **Errored** | ${{ steps.policy-checks.outputs.policies_errored }} |" >> $GITHUB_STEP_SUMMARY
             echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🔧 **Enforcement Mode** | Advisory (warnings only) |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "> 💡 **Policy Governance**: Sentinel policies validate configuration compliance even when no infrastructure changes are detected. View detailed policy results in the Terraform Cloud run." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
