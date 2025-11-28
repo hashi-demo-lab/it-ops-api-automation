@@ -54,6 +54,7 @@ jobs:
       - name: Create Run
         uses: hashicorp/tfc-workflows-github/actions/create-run@v1.3.2
         id: create-run
+        continue-on-error: true
         with:
           workspace: ${{ env.TF_WORKSPACE }}
           configuration_version: ${{ steps.upload.outputs.configuration_version_id }}
@@ -65,6 +66,30 @@ jobs:
             Commit: ${{ github.sha }}
           # plan_only: false (default) - allow this run to be applied
           # is_destroy: false (default) - this is a normal apply, not a destroy
+          # continue-on-error: true - don't fail if status is post_plan_awaiting_decision (soft-mandatory policy override needed)
+
+      # Step 3b: Validate create-run outcome
+      - name: Validate Create Run Status
+        if: steps.create-run.conclusion == 'failure'
+        run: |
+          RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+
+          echo "::group::Create Run Error Analysis"
+          echo "Run Status: $RUN_STATUS"
+          echo "Run ID: ${{ steps.create-run.outputs.run_id }}"
+          echo "Plan Status: ${{ steps.create-run.outputs.plan_status }}"
+          echo "::endgroup::"
+
+          # These are EXPECTED statuses when soft-mandatory policies fail
+          if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
+            echo "::notice::✅ Run is paused for policy override - this is expected behavior for soft-mandatory policies"
+            echo "::notice::📋 Plan completed successfully, waiting for policy override decision"
+          else
+            # This is an ACTUAL error
+            echo "::error::❌ Unexpected run status: $RUN_STATUS"
+            echo "::error::This is not a policy override state - the run has failed"
+            exit 1
+          fi
 
       # Step 4: Get plan output to check if changes exist
       - name: Get Plan Output
@@ -226,10 +251,14 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Status badge at the top
+          RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+
           if [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
             echo "## ✨ No Changes Required" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
+            echo "## ⏸️ Awaiting Policy Override" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Error" ]; then
             echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
           else
@@ -312,7 +341,22 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Conditional success/failure message
-          if [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
+          if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
+            echo "### 🚨 Action Required: Policy Override Needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The run has been paused due to **mandatory policy failure(s)**. If this is a **soft-mandatory** policy, you can override it:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Override Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 🔗 Open the [run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 Review the policy failure details" >> $GITHUB_STEP_SUMMARY
+            echo "3. ✅ Click **\"Override & Continue\"** button (if available)" >> $GITHUB_STEP_SUMMARY
+            echo "4. 📝 Provide justification for the override" >> $GITHUB_STEP_SUMMARY
+            echo "5. ⏭️ The apply will automatically proceed after override" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Note**: If the policy is **hard-mandatory**, you cannot override it. You must fix the code to comply with the policy." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⏰ **Timeout**: The workflow will wait up to **1 hour** for override. After that, it will fail with a timeout error." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Your infrastructure changes have been successfully applied! The Terraform configuration was:" >> $GITHUB_STEP_SUMMARY
