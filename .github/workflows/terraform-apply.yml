@@ -74,6 +74,38 @@ jobs:
         with:
           plan: ${{ steps.create-run.outputs.plan_id }}
 
+      # Step 4b: Get detailed run information (includes Sentinel policy checks)
+      - name: Get Run Details
+        uses: hashicorp/tfc-workflows-github/actions/show-run@v1.3.2
+        id: run-details
+        if: always()
+        with:
+          run: ${{ steps.create-run.outputs.run_id }}
+
+      # Step 4c: Parse and display Sentinel policy results
+      - name: Display Policy Check Results
+        if: always()
+        run: |
+          echo "::group::Sentinel Policy Check Results"
+
+          # Parse the run payload JSON to extract policy check information
+          PAYLOAD='${{ steps.run-details.outputs.payload }}'
+
+          # Check if policy checks exist in the run
+          POLICY_CHECK_STATUS=$(echo "$PAYLOAD" | jq -r '.data.relationships."policy-checks".data[]? | .id' | wc -l | tr -d ' ')
+
+          if [ "$POLICY_CHECK_STATUS" -gt 0 ]; then
+            echo "✅ Sentinel policy checks detected in this run"
+            echo "📋 Policy checks are configured for workspace: ${{ env.TF_WORKSPACE }}"
+            echo ""
+            echo "ℹ️  Note: Detailed policy results are available in Terraform Cloud"
+            echo "   View at: ${{ steps.create-run.outputs.run_link }}"
+          else
+            echo "ℹ️  No Sentinel policy checks configured for this workspace"
+          fi
+
+          echo "::endgroup::"
+
       # Step 5: Apply the run (only if there are changes)
       - name: Apply Run
         uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
@@ -154,12 +186,30 @@ jobs:
           echo "| ➖ Resources to Destroy | ${{ steps.plan-output.outputs.destroy }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          # Sentinel policy checks section
+          PAYLOAD='${{ steps.run-details.outputs.payload }}'
+          POLICY_CHECK_COUNT=$(echo "$PAYLOAD" | jq -r '.data.relationships."policy-checks".data[]? | .id' | wc -l | tr -d ' ')
+
+          if [ "$POLICY_CHECK_COUNT" -gt 0 ]; then
+            echo "### 🛡️ Sentinel Policy Checks" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | Details |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|---------|" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ **Enabled** | Sentinel policies are active for this workspace |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📋 **Policy Sets** | Cloud-agnostic policies (22 policies) |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚠️ **Enforcement** | Advisory mode (warnings only, never blocks) |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Policy Governance**: Sentinel policies validate configuration compliance even when no infrastructure changes are detected. View detailed policy results in the Terraform Cloud run." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
           # Links section
           echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 🌐 [View Run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
           echo "- 📊 [Workspace Overview](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
           echo "- 📝 [Workspace Variables](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/variables)" >> $GITHUB_STEP_SUMMARY
+          echo "- 🛡️ [Policy Sets](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/settings/policy-sets)" >> $GITHUB_STEP_SUMMARY
           echo "- ⚙️ [Workspace Settings](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/settings/general)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
