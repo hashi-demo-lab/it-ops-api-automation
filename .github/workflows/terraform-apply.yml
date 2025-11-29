@@ -131,12 +131,25 @@ jobs:
         if: steps.create-run.conclusion == 'failure'
         run: |
           RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+          RUN_ID="${{ steps.create-run.outputs.run_id }}"
 
           echo "::group::Create Run Error Analysis"
           echo "Run Status: $RUN_STATUS"
-          echo "Run ID: ${{ steps.create-run.outputs.run_id }}"
+          echo "Run ID: $RUN_ID"
           echo "Plan Status: ${{ steps.create-run.outputs.plan_status }}"
           echo "::endgroup::"
+
+          # Check if run was even created
+          if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
+            echo "::error::❌ Failed to create run in TFC"
+            echo "::error::This typically indicates:"
+            echo "::error::  - Workspace is locked by another operation"
+            echo "::error::  - Insufficient permissions"
+            echo "::error::  - TFC API issue"
+            echo ""
+            echo "Check the concurrent runs warning above - workspace may be locked."
+            exit 1
+          fi
 
           # These are EXPECTED statuses when soft-mandatory policies fail
           if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
@@ -153,7 +166,7 @@ jobs:
       - name: Get Plan Output
         uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.3.2
         id: plan-output
-        if: always()
+        if: always() && steps.create-run.outputs.plan_id != ''
         with:
           plan: ${{ steps.create-run.outputs.plan_id }}
 
@@ -161,7 +174,7 @@ jobs:
       - name: Get Run Details
         uses: hashicorp/tfc-workflows-github/actions/show-run@v1.3.2
         id: run-details
-        if: always()
+        if: always() && steps.create-run.outputs.run_id != ''
         with:
           run: ${{ steps.create-run.outputs.run_id }}
 
@@ -337,7 +350,39 @@ jobs:
             local run_data=$1
             local run_id=$2
 
-            local override_by=$(echo "$run_data" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
+            # DEBUG: Show raw API response structure
+            echo "::group::🔍 DEBUG: Raw Run Data Structure"
+            echo "Fetching run with includes..."
+            local run_data_full=$(tfc_api_call "/runs/$run_id?include=created_by")
+
+            echo "=== Full Response Structure ==="
+            echo "$run_data_full" | jq '.'
+
+            echo ""
+            echo "=== Checking for user in 'included' array ==="
+            echo "$run_data_full" | jq '.included[]? | select(.type == "users")'
+
+            echo ""
+            echo "=== Checking policy-override attributes ==="
+            echo "$run_data" | jq '.data.attributes."policy-override"'
+
+            echo "::endgroup::"
+
+            # Extract username from created_by relationship (user who did the override)
+            local override_by=$(echo "$run_data_full" | jq -r '
+              .included[]? | select(.type == "users") | .attributes.username // "Unknown"
+            ')
+
+            # If still not found, try alternate paths
+            if [[ "$override_by" == "Unknown" || "$override_by" == "null" || -z "$override_by" ]]; then
+              echo "First attempt failed, trying alternate paths..."
+              override_by=$(echo "$run_data" | jq -r '.data.attributes."created-by" // "Unknown"')
+            fi
+
+            if [[ "$override_by" == "Unknown" || "$override_by" == "null" || -z "$override_by" ]]; then
+              echo "Second attempt failed, trying policy-override path..."
+              override_by=$(echo "$run_data_full" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
+            fi
 
             # Fetch override comment from comments API
             local comments_data=$(tfc_api_call "/runs/$run_id/comments")
@@ -541,13 +586,15 @@ jobs:
           echo "::error::Please override the policy in TFC or update your code to comply"
           exit 1
 
-      # Step 6: Apply the run (only if there are changes and not already applied manually)
+      # Step 6: Apply the run (only if there are changes and not already applied manually or discarded)
       - name: Apply Run
         uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
         id: apply
         if: |
           (steps.plan-output.outputs.add != '0' || steps.plan-output.outputs.change != '0' || steps.plan-output.outputs.destroy != '0') &&
-          steps.wait-for-override.outputs.manual_apply_completed != 'true'
+          steps.wait-for-override.outputs.manual_apply_completed != 'true' &&
+          steps.wait-for-override.outputs.run_discarded != 'true' &&
+          steps.wait-for-override.outputs.run_canceled != 'true'
         with:
           run: ${{ steps.create-run.outputs.run_id }}
           comment: |
@@ -578,6 +625,17 @@ jobs:
           echo ""
           echo "🔗 View results: ${{ steps.create-run.outputs.run_link }}"
 
+      # Step 6c: Run discarded message
+      - name: Run Discarded
+        if: steps.wait-for-override.outputs.run_discarded == 'true'
+        run: |
+          echo "::notice::🗑️ Run was discarded in TFC"
+          echo ""
+          echo "The run was intentionally discarded - no infrastructure changes applied."
+          echo "This is not an error. Skipping apply step."
+          echo ""
+          echo "🔗 Discarded run: ${{ steps.create-run.outputs.run_link }}"
+
       # Step 7: Skip message when no changes
       - name: No Changes Detected
         if: steps.plan-output.outputs.add == '0' && steps.plan-output.outputs.change == '0' && steps.plan-output.outputs.destroy == '0'
@@ -595,8 +653,14 @@ jobs:
           # Status badge at the top
           RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
           MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
+          RUN_DISCARDED="${{ steps.wait-for-override.outputs.run_discarded }}"
+          RUN_CANCELED="${{ steps.wait-for-override.outputs.run_canceled }}"
 
-          if [[ "$MANUAL_APPLY" == "true" ]]; then
+          if [[ "$RUN_DISCARDED" == "true" ]]; then
+            echo "## 🗑️ Run Discarded" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_CANCELED" == "true" ]]; then
+            echo "## ⛔ Run Canceled" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$MANUAL_APPLY" == "true" ]]; then
             echo "## ⚠️ Applied Manually in TFC" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
             echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
@@ -636,8 +700,21 @@ jobs:
           echo "| **Plan ID** | \`${{ steps.create-run.outputs.plan_id }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Configuration Version** | \`${{ steps.upload.outputs.configuration_version_id }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Plan Status** | \`${{ steps.create-run.outputs.plan_status }}\` |" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
-            echo "| **Apply Status** | \`Skipped (no changes)\` |" >> $GITHUB_STEP_SUMMARY
+
+          # Determine apply status based on different scenarios
+          if [[ "$RUN_DISCARDED" == "true" ]]; then
+            echo "| **Apply Status** | \`Discarded\` |" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_CANCELED" == "true" ]]; then
+            echo "| **Apply Status** | \`Canceled\` |" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$MANUAL_APPLY" == "true" ]]; then
+            echo "| **Apply Status** | \`Applied manually in TFC\` |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
+            # Check WHY it was skipped
+            if [ "${{ steps.plan-output.outputs.add }}" == "0" ] && [ "${{ steps.plan-output.outputs.change }}" == "0" ] && [ "${{ steps.plan-output.outputs.destroy }}" == "0" ]; then
+              echo "| **Apply Status** | \`Skipped (no changes)\` |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| **Apply Status** | \`Skipped\` |" >> $GITHUB_STEP_SUMMARY
+            fi
           else
             echo "| **Apply Status** | \`${{ steps.apply.outputs.status }}\` |" >> $GITHUB_STEP_SUMMARY
           fi
@@ -702,7 +779,31 @@ jobs:
           # Check if manual apply was completed in TFC
           MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
 
-          if [[ "$OVERRIDE_WAIT_CONCLUSION" == "failure" ]]; then
+          if [[ "$RUN_DISCARDED" == "true" ]]; then
+            echo "### 🗑️ Run Was Discarded" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The run was intentionally discarded in Terraform Cloud. No infrastructure changes were applied." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**What Happened:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 Configuration uploaded to Terraform Cloud" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 Plan completed (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. 🛡️ Sentinel policy failed (soft-mandatory)" >> $GITHUB_STEP_SUMMARY
+            echo "4. ⏸️ Workflow waited for policy override" >> $GITHUB_STEP_SUMMARY
+            echo "5. 🗑️ Run was discarded (intentional choice not to proceed)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Not an Error**: Discarding a run is a valid workflow. If you want to proceed with these changes, update your code (if needed) and commit again to trigger a new run." >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_CANCELED" == "true" ]]; then
+            echo "### ⛔ Run Was Canceled" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The run was canceled manually in Terraform Cloud." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Possible Reasons:**" >> $GITHUB_STEP_SUMMARY
+            echo "- User clicked 'Cancel Run' in TFC UI" >> $GITHUB_STEP_SUMMARY
+            echo "- Workspace admin force-canceled the run" >> $GITHUB_STEP_SUMMARY
+            echo "- Run exceeded workspace timeout limits" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 🔗 Review the [run details in TFC](${{ steps.create-run.outputs.run_link }}) to see why it was canceled." >> $GITHUB_STEP_SUMMARY
+          elif [[ "$OVERRIDE_WAIT_CONCLUSION" == "failure" ]]; then
             echo "### ⏱️ Policy Override Timeout" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "The workflow waited 1 hour for a policy override but none was provided." >> $GITHUB_STEP_SUMMARY
