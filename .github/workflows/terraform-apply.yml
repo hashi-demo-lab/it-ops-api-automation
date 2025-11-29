@@ -50,6 +50,64 @@ jobs:
           directory: "."  # Upload from repository root
           # speculative: false (default) - this is a real run, not just a plan-only test
 
+      # Step 2b: Check for concurrent runs
+      - name: Check for Concurrent Runs
+        id: concurrent-check
+        run: |
+          echo "🔍 Checking for other active runs in workspace..."
+
+          # Get workspace ID first
+          WORKSPACE_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
+
+          WORKSPACE_ID=$(echo "$WORKSPACE_DATA" | jq -r '.data.id')
+
+          # Get current runs for this workspace
+          RUNS_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/workspaces/$WORKSPACE_ID/runs?page%5Bsize%5D=5")
+
+          # Check for runs in active states (not completed/errored/canceled/discarded)
+          ACTIVE_RUNS=$(echo "$RUNS_DATA" | jq -r '
+            [.data[] | select(
+              .attributes.status != "applied" and
+              .attributes.status != "discarded" and
+              .attributes.status != "canceled" and
+              .attributes.status != "errored" and
+              .attributes.status != "planned_and_finished"
+            )] | length
+          ')
+
+          echo "Active runs found: $ACTIVE_RUNS"
+
+          if [ "$ACTIVE_RUNS" -gt 0 ]; then
+            echo ""
+            echo "⚠️  WARNING: $ACTIVE_RUNS active run(s) detected in workspace"
+            echo ""
+
+            # Show details of active runs
+            echo "$RUNS_DATA" | jq -r '
+              .data[] | select(
+                .attributes.status != "applied" and
+                .attributes.status != "discarded" and
+                .attributes.status != "canceled" and
+                .attributes.status != "errored" and
+                .attributes.status != "planned_and_finished"
+              ) | "  • Run \(.id): \(.attributes.status) (created: \(.attributes."created-at"))"
+            '
+
+            echo ""
+            echo "⏳ Workspace may be locked or queued."
+            echo "This run will likely wait in queue until previous runs complete."
+            echo ""
+            echo "::warning::Concurrent runs detected - this run may queue"
+          else
+            echo "✅ No concurrent runs - proceeding"
+          fi
+
       # Step 3: Create a run (triggers plan)
       - name: Create Run
         uses: hashicorp/tfc-workflows-github/actions/create-run@v1.3.2
@@ -224,11 +282,118 @@ jobs:
             echo "requires_override=false" >> $GITHUB_OUTPUT
           fi
 
+      # Step 4e: Check workspace auto-apply setting
+      - name: Check Workspace Configuration
+        if: steps.policy-override.outputs.requires_override == 'true'
+        run: |
+          echo "🔍 Checking workspace configuration..."
+
+          # Get workspace details
+          WORKSPACE_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
+
+          AUTO_APPLY=$(echo "$WORKSPACE_DATA" | jq -r '.data.attributes."auto-apply"')
+
+          echo "Workspace auto-apply setting: $AUTO_APPLY"
+
+          if [[ "$AUTO_APPLY" == "true" ]]; then
+            echo ""
+            echo "::notice::⚡ Workspace has auto-apply enabled"
+            echo "After policy override, TFC will automatically queue the apply."
+            echo "This workflow will detect the auto-apply and skip the API apply call."
+          else
+            echo ""
+            echo "::notice::✋ Workspace has manual apply (auto-apply: false)"
+            echo "After policy override, this workflow will trigger apply via API."
+            echo ""
+            echo "💡 Expected workflow:"
+            echo "   1. Override policy in TFC (provide justification)"
+            echo "   2. DO NOT click 'Confirm & Apply' in TFC"
+            echo "   3. This workflow will automatically trigger apply"
+          fi
+
       # Step 5: Wait for policy override if required
       - name: Wait for Policy Override
         id: wait-for-override
         if: steps.policy-override.outputs.requires_override == 'true'
         run: |
+          # ============================================================================
+          # HELPER FUNCTIONS
+          # ============================================================================
+
+          # Function: Call TFC API with consistent auth headers
+          tfc_api_call() {
+            local endpoint=$1
+            curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2${endpoint}"
+          }
+
+          # Function: Extract override details from run data and comments
+          extract_override_details() {
+            local run_data=$1
+            local run_id=$2
+
+            local override_by=$(echo "$run_data" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
+
+            # Fetch override comment from comments API
+            local comments_data=$(tfc_api_call "/runs/$run_id/comments")
+            local override_comment=$(echo "$comments_data" | jq -r '.data[-1].attributes.body // "No comment provided"')
+
+            # Output to GitHub Actions output
+            {
+              echo "override_by=$override_by"
+              echo "override_comment<<EOF"
+              echo "$override_comment"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+
+            # Also return for local use
+            echo "$override_by|$override_comment"
+          }
+
+          # Function: Classify run status into actionable categories
+          classify_run_status() {
+            local status=$1
+
+            case $status in
+              post_plan_awaiting_decision)
+                echo "waiting_override"
+                ;;
+              policy_override|post_plan_completed)
+                echo "override_complete"
+                ;;
+              apply_queued)
+                echo "apply_queued"
+                ;;
+              applying)
+                echo "applying"
+                ;;
+              applied)
+                echo "applied"
+                ;;
+              discarded)
+                echo "discarded"
+                ;;
+              canceled|force_canceled)
+                echo "canceled"
+                ;;
+              errored)
+                echo "errored"
+                ;;
+              *)
+                echo "unknown"
+                ;;
+            esac
+          }
+
+          # ============================================================================
+          # MAIN LOGIC
+          # ============================================================================
+
           echo "⏸️ Run is awaiting policy override..."
           echo ""
           echo "🔗 Override in TFC: ${{ steps.create-run.outputs.run_link }}"
@@ -257,102 +422,113 @@ jobs:
           ELAPSED=0
 
           while [ $ELAPSED -lt $MAX_WAIT ]; do
-            # Get current run status
-            RUN_DATA=$(curl -s \
-              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
-              --header "Content-Type: application/vnd.api+json" \
-              "https://app.terraform.io/api/v2/runs/${{ steps.create-run.outputs.run_id }}")
-
+            # Get current run status using helper function
+            RUN_DATA=$(tfc_api_call "/runs/${{ steps.create-run.outputs.run_id }}")
             CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
+            STATUS_CLASS=$(classify_run_status "$CURRENT_STATUS")
 
-            echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS"
+            echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS (classified as: $STATUS_CLASS)"
 
-            # Check if override was applied - run is ready for API apply
-            # We want to catch it at "policy_override" or "post_plan_completed" status
-            # Before it auto-proceeds to applying
-            if [[ "$CURRENT_STATUS" == "policy_override" ]] || \
-               [[ "$CURRENT_STATUS" == "post_plan_completed" ]]; then
-              echo ""
-              echo "✅ Policy override detected! Run status: $CURRENT_STATUS"
-              echo "Override complete - workflow will now trigger apply via API..."
+            # Handle different status classifications
+            case $STATUS_CLASS in
+              override_complete|apply_queued)
+                # Override detected - ready for API apply
+                echo ""
+                echo "✅ Policy override detected! Run status: $CURRENT_STATUS"
+                echo "Override complete - workflow will now trigger apply via API..."
 
-              # Fetch policy override details (who overrode and their comment)
-              OVERRIDE_BY=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
-              OVERRIDE_AT=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override"."overridden-at" // ""')
-              OVERRIDE_COMMENT=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override".comment // "No comment provided"')
+                # Extract override details using helper function
+                OVERRIDE_DETAILS=$(extract_override_details "$RUN_DATA" "${{ steps.create-run.outputs.run_id }}")
+                OVERRIDE_BY=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f1)
+                OVERRIDE_COMMENT=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f2-)
 
-              echo ""
-              echo "📋 Override Details:"
-              echo "   Overridden by: $OVERRIDE_BY"
-              if [[ -n "$OVERRIDE_AT" && "$OVERRIDE_AT" != "null" ]]; then
-                echo "   Overridden at: $OVERRIDE_AT"
-              fi
-              echo "   Justification: $OVERRIDE_COMMENT"
+                echo ""
+                echo "📋 Override Details:"
+                echo "   Overridden by: $OVERRIDE_BY"
+                echo "   Justification: $OVERRIDE_COMMENT"
 
-              # Save override details for summary
-              {
-                echo "override_detected=true"
-                echo "manual_apply_completed=false"
-                echo "override_by=$OVERRIDE_BY"
-                echo "override_comment<<EOF"
-                echo "$OVERRIDE_COMMENT"
-                echo "EOF"
-              } >> $GITHUB_OUTPUT
+                # Mark as ready for API apply
+                echo "override_detected=true" >> $GITHUB_OUTPUT
+                echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
 
-              exit 0
-            fi
+              applying|applied)
+                # Manual apply detected
+                echo ""
+                echo "⚠️  Apply was manually triggered in TFC UI (status: $CURRENT_STATUS)"
+                echo "For proper workflow control, after override, let the GitHub Actions workflow trigger the apply."
+                echo "Skipping apply-run step since apply is already in progress/done."
 
-            # Check if run proceeded to apply queue (auto-apply workspace)
-            if [[ "$CURRENT_STATUS" == "apply_queued" ]]; then
-              echo ""
-              echo "✅ Override complete and run queued for apply"
-              echo "Apply will be triggered via API..."
-              echo "override_detected=true" >> $GITHUB_OUTPUT
-              echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+                # Extract override details
+                OVERRIDE_DETAILS=$(extract_override_details "$RUN_DATA" "${{ steps.create-run.outputs.run_id }}")
+                OVERRIDE_BY=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f1)
+                OVERRIDE_COMMENT=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f2-)
 
-            # Check if run is already being applied or was applied in TFC UI
-            # This means you manually clicked "Confirm & Apply" in TFC instead of letting the workflow do it
-            if [[ "$CURRENT_STATUS" == "applying" ]] || \
-               [[ "$CURRENT_STATUS" == "applied" ]]; then
-              echo ""
-              echo "⚠️  Apply was manually triggered in TFC UI (status: $CURRENT_STATUS)"
-              echo "For proper workflow control, after override, let the GitHub Actions workflow trigger the apply."
-              echo "Skipping apply-run step since apply is already in progress/done."
+                echo ""
+                echo "📋 Override Details:"
+                echo "   Overridden by: $OVERRIDE_BY"
+                echo "   Justification: $OVERRIDE_COMMENT"
 
-              # Fetch policy override details
-              OVERRIDE_BY=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
-              OVERRIDE_COMMENT=$(echo "$RUN_DATA" | jq -r '.data.attributes."policy-override".comment // "No comment provided"')
+                # Mark as manually applied
+                echo "override_detected=true" >> $GITHUB_OUTPUT
+                echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
 
-              echo ""
-              echo "📋 Override Details:"
-              echo "   Overridden by: $OVERRIDE_BY"
-              echo "   Justification: $OVERRIDE_COMMENT"
+              discarded)
+                # Run was discarded
+                echo ""
+                echo "🗑️  Run was discarded - user chose not to proceed"
+                echo "No infrastructure changes have been applied."
+                echo "This is not an error - the run was intentionally discarded."
+                echo ""
+                echo "If you want to proceed with these changes:"
+                echo "  1. Review and update your code if needed"
+                echo "  2. Commit and push to trigger a new run"
+                echo "run_discarded=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
 
-              # Save override details for summary
-              {
-                echo "override_detected=true"
-                echo "manual_apply_completed=true"
-                echo "override_by=$OVERRIDE_BY"
-                echo "override_comment<<EOF"
-                echo "$OVERRIDE_COMMENT"
-                echo "EOF"
-              } >> $GITHUB_OUTPUT
+              canceled)
+                # Run was canceled
+                echo ""
+                echo "⛔ Run was canceled manually in TFC"
+                echo "Status: $CURRENT_STATUS"
+                echo ""
+                echo "Cancellation can occur if:"
+                echo "  - User clicked 'Cancel Run' in TFC UI"
+                echo "  - Workspace admin force-canceled the run"
+                echo "  - Run exceeded workspace timeout limits"
+                echo ""
+                echo "run_canceled=true" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
 
-              exit 0
-            fi
+              errored)
+                # Run errored
+                echo ""
+                echo "❌ Run ended with error status"
+                echo "This typically indicates:"
+                echo "  - Policy evaluation error"
+                echo "  - TFC internal error"
+                echo "  - Workspace configuration issue"
+                echo ""
+                echo "Check run details: ${{ steps.create-run.outputs.run_link }}"
+                exit 1
+                ;;
 
-            # Check if run ended in a terminal state (failed, discarded, etc.)
-            if [[ "$CURRENT_STATUS" == "discarded" ]] || \
-               [[ "$CURRENT_STATUS" == "errored" ]] || \
-               [[ "$CURRENT_STATUS" == "canceled" ]] || \
-               [[ "$CURRENT_STATUS" == "force_canceled" ]]; then
-              echo ""
-              echo "❌ Run ended with terminal status: $CURRENT_STATUS"
-              echo "Cannot proceed - workflow will fail"
-              exit 1
-            fi
+              waiting_override)
+                # Still waiting - continue polling
+                ;;
+
+              *)
+                # Unknown status
+                echo ""
+                echo "⚠️  Unknown run status: $CURRENT_STATUS"
+                echo "Continuing to wait..."
+                ;;
+            esac
 
             # Still waiting...
             sleep $POLL_INTERVAL
