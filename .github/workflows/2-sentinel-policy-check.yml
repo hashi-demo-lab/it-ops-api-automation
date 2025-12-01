@@ -125,27 +125,26 @@ jobs:
             # Get the policy checks (this includes policy names and results)
             POLICY_CHECKS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-checks")
 
-            # Extract failed mandatory policies with their results
+            # Debug: Show what we got back
+            echo "DEBUG: Policy checks response structure:"
+            echo "$POLICY_CHECKS" | jq -c '{data_exists: (.data != null), data_length: (.data | length // 0), first_item: (.data[0] // null)}'
+            echo ""
+
+            # Extract failed mandatory policies with their results (safer parsing)
             FAILED_MANDATORY_POLICIES=$(echo "$POLICY_CHECKS" | jq -r '
-              if .data then
+              if (.data != null and (.data | length) > 0) then
                 [.data[] |
-                  select(.attributes.scope == "organization" or .attributes.scope == "workspace") |
                   select(.attributes.status == "failed") |
-                  select(.attributes."enforcement-level" // .attributes."enforcement-mode" == "mandatory") |
-                  {
-                    name: .attributes.name,
-                    result: (.attributes.result // "Failed"),
-                    message: (.attributes."status-timestamps" // {} | if . then "Check failed" else "Check failed" end)
-                  } |
-                  "- **\(.name)** (mandatory)\n  Result: \(.result)"
+                  select((.attributes."enforcement-level" // .attributes."enforcement-mode") == "mandatory") |
+                  "- **\(.attributes.name)** (\(.attributes."enforcement-level" // .attributes."enforcement-mode"))"
                 ] |
                 if length > 0 then
                   join("\n")
                 else
-                  "No failed mandatory policies found in API response"
+                  "Mandatory policies failed but no details available - view in TFC"
                 end
               else
-                "Unable to retrieve policy check details from API"
+                "API returned no policy check data - view details in TFC"
               end
             ')
 
@@ -160,9 +159,6 @@ jobs:
             echo "🚫 Failed Mandatory Policies:"
             echo "$FAILED_MANDATORY_POLICIES"
             echo ""
-
-            # Also save raw policy check data for debugging
-            echo "policy_checks_count=$(echo "$POLICY_CHECKS" | jq '[.data[]] | length')" >> $GITHUB_OUTPUT
           else
             # No policy details to fetch
             {
