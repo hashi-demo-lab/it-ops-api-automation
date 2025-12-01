@@ -347,7 +347,42 @@ jobs:
 
           # Function: Extract override details from run data and comments
           extract_override_details() {
-            local run_id=$1
+            local run_data=$1
+            local run_id=$2
+
+            # DEBUG: Show raw API response structure
+            echo "::group::🔍 DEBUG: Raw Run Data Structure"
+            echo "Fetching run with includes..."
+            local run_data_full=$(tfc_api_call "/runs/$run_id?include=created_by")
+
+            echo "=== Full Response Structure ==="
+            echo "$run_data_full" | jq '.'
+
+            echo ""
+            echo "=== Checking for user in 'included' array ==="
+            echo "$run_data_full" | jq '.included[]? | select(.type == "users")'
+
+            echo ""
+            echo "=== Checking policy-override attributes ==="
+            echo "$run_data" | jq '.data.attributes."policy-override"'
+
+            echo "::endgroup::"
+
+            # Extract username from created_by relationship (user who did the override)
+            local override_by=$(echo "$run_data_full" | jq -r '
+              .included[]? | select(.type == "users") | .attributes.username // "Unknown"
+            ')
+
+            # If still not found, try alternate paths
+            if [[ "$override_by" == "Unknown" || "$override_by" == "null" || -z "$override_by" ]]; then
+              echo "First attempt failed, trying alternate paths..."
+              override_by=$(echo "$run_data" | jq -r '.data.attributes."created-by" // "Unknown"')
+            fi
+
+            if [[ "$override_by" == "Unknown" || "$override_by" == "null" || -z "$override_by" ]]; then
+              echo "Second attempt failed, trying policy-override path..."
+              override_by=$(echo "$run_data_full" | jq -r '.data.attributes."policy-override"."overridden-by" // "Unknown"')
+            fi
 
             # Fetch override comment from comments API
             local comments_data=$(tfc_api_call "/runs/$run_id/comments")
@@ -355,10 +390,14 @@ jobs:
 
             # Output to GitHub Actions output
             {
+              echo "override_by=$override_by"
               echo "override_comment<<EOF"
               echo "$override_comment"
               echo "EOF"
             } >> $GITHUB_OUTPUT
+
+            # Also return for local use
+            echo "$override_by|$override_comment"
           }
 
           # Function: Classify run status into actionable categories
@@ -444,7 +483,14 @@ jobs:
                 echo "Override complete - workflow will now trigger apply via API..."
 
                 # Extract override details using helper function
-                extract_override_details "${{ steps.create-run.outputs.run_id }}"
+                OVERRIDE_DETAILS=$(extract_override_details "$RUN_DATA" "${{ steps.create-run.outputs.run_id }}")
+                OVERRIDE_BY=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f1)
+                OVERRIDE_COMMENT=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f2-)
+
+                echo ""
+                echo "📋 Override Details:"
+                echo "   Overridden by: $OVERRIDE_BY"
+                echo "   Justification: $OVERRIDE_COMMENT"
 
                 # Mark as ready for API apply
                 echo "override_detected=true" >> $GITHUB_OUTPUT
@@ -460,7 +506,14 @@ jobs:
                 echo "Skipping apply-run step since apply is already in progress/done."
 
                 # Extract override details
-                extract_override_details "${{ steps.create-run.outputs.run_id }}"
+                OVERRIDE_DETAILS=$(extract_override_details "$RUN_DATA" "${{ steps.create-run.outputs.run_id }}")
+                OVERRIDE_BY=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f1)
+                OVERRIDE_COMMENT=$(echo "$OVERRIDE_DETAILS" | cut -d'|' -f2-)
+
+                echo ""
+                echo "📋 Override Details:"
+                echo "   Overridden by: $OVERRIDE_BY"
+                echo "   Justification: $OVERRIDE_COMMENT"
 
                 # Mark as manually applied
                 echo "override_detected=true" >> $GITHUB_OUTPUT
@@ -695,9 +748,10 @@ jobs:
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "#### 🛡️ Policy Override Details" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Justification:**" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> ${{ steps.wait-for-override.outputs.override_comment }}" >> $GITHUB_STEP_SUMMARY
+              echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| **Overridden By** | \`${{ steps.wait-for-override.outputs.override_by }}\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Justification** | ${{ steps.wait-for-override.outputs.override_comment }} |" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "> 📝 **Audit Trail**: Policy override decision recorded. All overrides are logged in Terraform Cloud for compliance review." >> $GITHUB_STEP_SUMMARY
             elif [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
