@@ -47,6 +47,8 @@ jobs:
       - name: Check for Concurrent Runs
         id: concurrent-check
         run: |
+          echo "🔍 Checking for active runs in workspace..."
+
           # Get workspace ID first
           WORKSPACE_DATA=$(curl -s \
             --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
@@ -54,6 +56,26 @@ jobs:
             "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
 
           WORKSPACE_ID=$(echo "$WORKSPACE_DATA" | jq -r '.data.id')
+
+          # Check if workspace is locked
+          WORKSPACE_LOCKED=$(echo "$WORKSPACE_DATA" | jq -r '.data.attributes.locked')
+
+          if [[ "$WORKSPACE_LOCKED" == "true" ]]; then
+            echo ""
+            echo "::error::🔒 Workspace is currently locked"
+            echo "::error::"
+            echo "::error::The workspace cannot accept new runs right now because:"
+            echo "::error::  - Another run is currently active and has locked the workspace"
+            echo "::error::  - A user may have manually locked the workspace"
+            echo "::error::"
+            echo "::error::Options to resolve:"
+            echo "::error::  1. Wait for the current run to complete"
+            echo "::error::  2. Discard/cancel the active run in TFC UI"
+            echo "::error::  3. Unlock the workspace if it was manually locked"
+            echo "::error::"
+            echo "::error::View workspace: https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}"
+            exit 1
+          fi
 
           # Get current runs for this workspace
           RUNS_DATA=$(curl -s \
@@ -73,11 +95,29 @@ jobs:
           ')
 
           if [ "$ACTIVE_RUNS" -gt 0 ]; then
+            echo ""
             echo "⚠️  WARNING: $ACTIVE_RUNS active run(s) detected in workspace"
-            echo "This run may queue behind existing runs."
-            echo "::warning::Concurrent runs detected - this run may queue"
+            echo ""
+
+            # Show details of active runs
+            echo "Active runs:"
+            echo "$RUNS_DATA" | jq -r '
+              .data[] | select(
+                .attributes.status != "applied" and
+                .attributes.status != "discarded" and
+                .attributes.status != "canceled" and
+                .attributes.status != "errored" and
+                .attributes.status != "planned_and_finished"
+              ) | "  • \(.id): \(.attributes.status)"
+            '
+
+            echo ""
+            echo "::warning::Concurrent runs detected - workspace may queue or lock this run"
+            echo ""
+            echo "Recommendation: Complete or discard active runs before creating a new one"
+            echo "Continuing anyway - TFC will queue this run if workspace is locked..."
           else
-            echo "✅ No concurrent runs detected"
+            echo "✅ No concurrent runs detected - workspace is available"
           fi
 
       - name: Create Run
@@ -97,20 +137,45 @@ jobs:
 
           # Check if run was even created
           if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
+            echo ""
             echo "::error::❌ Failed to create run in TFC"
-            echo "::error::This typically indicates:"
-            echo "::error::  - Workspace is locked by another operation"
-            echo "::error::  - Insufficient permissions"
-            echo "::error::  - TFC API issue"
+            echo "::error::"
+            echo "::error::The run could not be created. Common causes:"
+            echo "::error::"
+            echo "::error::  🔒 Workspace Locked:"
+            echo "::error::     - Another run is currently active and holding the lock"
+            echo "::error::     - Workspace was manually locked by a user"
+            echo "::error::     - Resolution: Discard/complete active runs or unlock workspace"
+            echo "::error::"
+            echo "::error::  🔑 Insufficient Permissions:"
+            echo "::error::     - TF_API_TOKEN doesn't have permission to create runs"
+            echo "::error::     - Token may be expired or revoked"
+            echo "::error::     - Resolution: Check token permissions in TFC"
+            echo "::error::"
+            echo "::error::  🌐 TFC API Issue:"
+            echo "::error::     - Temporary connectivity problem"
+            echo "::error::     - TFC service disruption"
+            echo "::error::     - Resolution: Check TFC status and retry"
+            echo "::error::"
+            echo "::error::View workspace: https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}"
             exit 1
           fi
 
           # These are EXPECTED statuses when soft-mandatory policies fail
           if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
-            echo "::notice::✅ Run is paused for policy override - this is expected"
-            echo "::notice::Run will be evaluated in the Policy Check workflow"
+            echo "::notice::✅ Run is paused for policy override - this is expected behavior"
+            echo "::notice::"
+            echo "::notice::A soft-mandatory Sentinel policy has failed, requiring manual override."
+            echo "::notice::This is the designed workflow for policy governance with exceptions."
+            echo "::notice::"
+            echo "::notice::Next steps:"
+            echo "::notice::  1. Run the '2. Sentinel Policy Check' workflow with run_id: $RUN_ID"
+            echo "::notice::  2. Review and override the policy in TFC UI if appropriate"
+            echo "::notice::  3. Run the '3. Terraform Apply' workflow to complete deployment"
           else
             echo "::error::❌ Unexpected run status: $RUN_STATUS"
+            echo "::error::Expected 'post_plan_awaiting_decision' or 'policy_override'"
+            echo "::error::This may indicate an unexpected error during plan execution"
             exit 1
           fi
 
