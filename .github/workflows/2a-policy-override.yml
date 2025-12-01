@@ -112,15 +112,15 @@ jobs:
             exit 1
           fi
 
-          # Get individual failed policies
-          POLICY_SET_RESULTS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
+          # Get individual failed policies from nested outcomes array
+          POLICY_SET_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
 
-          FAILED_POLICIES=$(echo "$POLICY_SET_RESULTS" | jq -r '
-            if .included then
-              [.included[] |
-                select(.type == "policy-outcomes") |
-                select(.attributes."enforcement-level" == "mandatory" and .attributes.status == "failed") |
-                "- \(.attributes.\"policy-name\")"
+          FAILED_POLICIES=$(echo "$POLICY_SET_OUTCOMES" | jq -r '
+            if (.data != null and (.data | length) > 0) then
+              [.data[].attributes.outcomes[] |
+                select(.status == "failed") |
+                select(.enforcement_level == "mandatory") |
+                "- \(.policy_name)"
               ] |
               if length > 0 then
                 join("\n")
