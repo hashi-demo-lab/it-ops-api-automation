@@ -1,0 +1,293 @@
+name: "2a. Policy Override"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'TFC Run ID to override'
+        required: true
+        type: string
+      justification:
+        description: 'Justification for overriding the policy (required for audit trail)'
+        required: true
+        type: string
+
+env:
+  TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+  TF_API_TOKEN: ${{ secrets.TF_API_APPROVAL_TOKEN }}
+  TF_WORKSPACE: ${{ vars.TF_WORKSPACE }}
+
+jobs:
+  policy-override:
+    name: "Override Mandatory Policy Failures"
+    runs-on: ubuntu-latest
+
+    outputs:
+      override_complete: ${{ steps.override.outputs.override_complete }}
+      final_status: ${{ steps.wait-override.outputs.final_status }}
+
+    steps:
+      - name: Verify Run Status
+        id: verify-run
+        run: |
+          echo "🔍 Verifying run is in correct state for override..."
+          echo ""
+
+          RUN_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}")
+
+          CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
+          echo "Current run status: $CURRENT_STATUS"
+          echo ""
+
+          # Verify run is awaiting override
+          if [[ "$CURRENT_STATUS" != "post_plan_awaiting_decision" ]]; then
+            echo "::error::❌ Run is not in the correct state for override"
+            echo "::error::"
+            echo "::error::Current status: $CURRENT_STATUS"
+            echo "::error::Expected status: post_plan_awaiting_decision"
+            echo "::error::"
+
+            case $CURRENT_STATUS in
+              planned|policy_override|post_plan_completed|apply_queued)
+                echo "::error::This run has already been overridden or doesn't need override."
+                echo "::error::Proceed to the Apply workflow (Workflow 3)."
+                ;;
+              applied)
+                echo "::error::This run has already been applied."
+                ;;
+              discarded)
+                echo "::error::This run was discarded and cannot be overridden."
+                ;;
+              *)
+                echo "::error::Cannot override a run in status: $CURRENT_STATUS"
+                ;;
+            esac
+            exit 1
+          fi
+
+          echo "✅ Run is awaiting policy override decision"
+          echo "run_link=https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/runs/${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT
+
+      - name: Get Failed Policies
+        id: get-policies
+        run: |
+          echo "📋 Retrieving failed mandatory policies..."
+          echo ""
+
+          # Function: Call TFC API
+          tfc_api_call() {
+            local endpoint=$1
+            curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2${endpoint}"
+          }
+
+          # Get task stages for this run
+          TASK_STAGES=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}/task-stages")
+
+          # Get policy stage ID
+          POLICY_STAGE_ID=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan") | .id' | head -n1)
+
+          if [[ -z "$POLICY_STAGE_ID" || "$POLICY_STAGE_ID" == "null" ]]; then
+            echo "::error::No policy evaluations found for this run"
+            exit 1
+          fi
+
+          # Get policy evaluations
+          POLICY_EVALS=$(tfc_api_call "/task-stages/$POLICY_STAGE_ID/policy-evaluations")
+          POLICY_EVAL_ID=$(echo "$POLICY_EVALS" | jq -r '.data[0].id')
+
+          # Get mandatory failed count
+          MANDATORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count"."mandatory-failed"] | add // 0')
+
+          echo "Mandatory policy failures: $MANDATORY_FAILED"
+          echo "mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
+
+          if [ "$MANDATORY_FAILED" -eq 0 ]; then
+            echo "::error::No mandatory policy failures found - override not needed"
+            exit 1
+          fi
+
+          # Get individual failed policies from nested outcomes array
+          POLICY_SET_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
+
+          FAILED_POLICIES=$(echo "$POLICY_SET_OUTCOMES" | jq -r '
+            if (.data != null and (.data | length) > 0) then
+              [.data[].attributes.outcomes[] |
+                select(.status == "failed") |
+                select(.enforcement_level == "mandatory") |
+                "- \(.policy_name)"
+              ] |
+              if length > 0 then
+                join("\n")
+              else
+                "No specific policy names available"
+              end
+            else
+              "No specific policy names available"
+            end
+          ')
+
+          echo ""
+          echo "Failed Mandatory Policies:"
+          echo "$FAILED_POLICIES"
+          echo ""
+
+          {
+            echo "failed_policies<<EOF"
+            echo "$FAILED_POLICIES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Apply Override
+        id: override
+        run: |
+          echo "🛡️ Applying policy override..."
+          echo ""
+          echo "Justification: ${{ github.event.inputs.justification }}"
+          echo ""
+
+          # Apply override via API
+          OVERRIDE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --request POST \
+            --data @- \
+            "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}/actions/override-policy" <<EOF
+          {
+            "comment": "${{ github.event.inputs.justification }}"
+          }
+EOF
+          )
+
+          # Extract HTTP status code and body
+          HTTP_CODE=$(echo "$OVERRIDE_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$OVERRIDE_RESPONSE" | sed '$d')
+
+          echo "Response status: $HTTP_CODE"
+
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "✅ Policy override applied successfully"
+            echo "override_complete=true" >> $GITHUB_OUTPUT
+          else
+            echo "::error::❌ Failed to apply override"
+            echo "::error::HTTP Status: $HTTP_CODE"
+            echo "::error::Response: $RESPONSE_BODY"
+            exit 1
+          fi
+
+      - name: Wait for Override Completion
+        id: wait-override
+        timeout-minutes: 5
+        run: |
+          echo "⏳ Waiting for override to complete..."
+          echo ""
+
+          MAX_WAIT=300  # 5 minutes
+          ELAPSED=0
+          CHECK_INTERVAL=10
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RUN_DATA=$(curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}")
+
+            CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
+            echo "[$(date +%H:%M:%S)] Current status: $CURRENT_STATUS"
+
+            case $CURRENT_STATUS in
+              policy_override|post_plan_completed|apply_queued)
+                echo ""
+                echo "✅ Override complete! Run status: $CURRENT_STATUS"
+                echo "final_status=$CURRENT_STATUS" >> $GITHUB_OUTPUT
+                echo "ready_for_apply=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+              errored)
+                echo "::error::❌ Run entered error state after override"
+                echo "final_status=errored" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+            esac
+
+            sleep $CHECK_INTERVAL
+            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+          done
+
+          echo "::warning::Override applied but status not yet updated (may take a moment)"
+          echo "final_status=override_pending" >> $GITHUB_OUTPUT
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "# 🛡️ Policy Override Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Status section
+          echo "### 🎯 Override Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Attribute | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workflow** | 2a. Policy Override |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | \`${{ github.event.inputs.run_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.override.outputs.override_complete }}" == "true" ]; then
+            echo "| **Status** | ✅ Override Applied |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Status** | ❌ Override Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Failed policies
+          if [ -n "${{ steps.get-policies.outputs.failed_policies }}" ]; then
+            echo "### 🚫 Overridden Policies" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The following mandatory policies were overridden:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.get-policies.outputs.failed_policies }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Justification
+          echo "### 📝 Justification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> ${{ github.event.inputs.justification }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Audit Trail**: This override decision is recorded in Terraform Cloud for compliance review." >> $GITHUB_STEP_SUMMARY
+          echo "> All policy overrides are logged with timestamp, user, and justification." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Next steps
+          echo "### ⏭️ Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.override.outputs.override_complete }}" == "true" ]; then
+            echo "**Override Successful - Ready to Apply:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- Run the \`3. Terraform Apply\` workflow to apply infrastructure changes" >> $GITHUB_STEP_SUMMARY
+            echo "- The run is now in status: \`${{ steps.wait-override.outputs.final_status }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Override Failed:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- Check the error messages above" >> $GITHUB_STEP_SUMMARY
+            echo "- Verify the run is in the correct state" >> $GITHUB_STEP_SUMMARY
+            echo "- Check token permissions (requires write access)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Links
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Run in TFC](${{ steps.verify-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Workspace: ${{ env.TF_WORKSPACE }}](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Metadata
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by GitHub Actions | Workflow: Policy Override | Overridden by: ${{ github.actor }}*" >> $GITHUB_STEP_SUMMARY
