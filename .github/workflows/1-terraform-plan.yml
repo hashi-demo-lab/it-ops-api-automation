@@ -198,6 +198,21 @@ jobs:
 
           echo "run_data=$RUN_DATA" >> $GITHUB_OUTPUT
 
+      - name: Save Run ID for Policy Check
+        if: always() && steps.create-run.outputs.run_id != ''
+        run: |
+          mkdir -p ./run-data
+          echo "${{ steps.create-run.outputs.run_id }}" > ./run-data/run_id.txt
+          echo "Saved run ID: ${{ steps.create-run.outputs.run_id }}"
+
+      - name: Upload Run ID Artifact
+        if: always() && steps.create-run.outputs.run_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-run-data
+          path: ./run-data/run_id.txt
+          retention-days: 1
+
       - name: Generate Summary
         if: always()
         run: |
