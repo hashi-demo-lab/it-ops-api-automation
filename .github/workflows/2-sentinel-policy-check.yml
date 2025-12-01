@@ -121,9 +121,26 @@ jobs:
           # Fetch individual policy outcomes with failure details
           if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
             echo "🔍 Fetching detailed policy outcomes..."
+            echo "Policy Eval ID: $POLICY_EVAL_ID"
 
             # Get the policy outcomes (individual policy results)
             POLICY_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-outcomes")
+
+            # Debug: Show the raw response
+            echo ""
+            echo "DEBUG: Raw API Response:"
+            echo "$POLICY_OUTCOMES" | jq -c '.'
+            echo ""
+            echo "DEBUG: Response structure:"
+            echo "$POLICY_OUTCOMES" | jq -c '{
+              has_data: (.data != null),
+              data_type: (.data | type),
+              data_length: (.data | length // 0),
+              has_errors: (.errors != null),
+              first_item_type: (.data[0].type // "none"),
+              first_item_attrs: (.data[0].attributes // null)
+            }'
+            echo ""
 
             # Extract failed mandatory policies with their results
             FAILED_MANDATORY_POLICIES=$(echo "$POLICY_OUTCOMES" | jq -r '
