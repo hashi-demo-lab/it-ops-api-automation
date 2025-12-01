@@ -12,10 +12,10 @@ on:
         required: false
         type: string
         default: 'Applied from GitHub Actions'
-  workflow_run:
-    workflows: ["2. Sentinel Policy Check"]
-    types:
-      - completed
+  # workflow_run:
+  #   workflows: ["2. Sentinel Policy Check"]
+  #   types:
+  #     - completed
 
 env:
   TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
