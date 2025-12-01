@@ -1,0 +1,828 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
+name: Terraform Cloud API Workflow
+
+# Trigger conditions - when should this workflow run?
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Only trigger when Terraform files change
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-apply.yml'
+
+  # Allow manual triggering from GitHub UI
+  workflow_dispatch:
+
+# Environment variables available to all jobs and steps
+env:
+  # These reference GitHub secrets/variables you configured in Task 2
+  TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+  TF_WORKSPACE: "it-ops-api-automation"
+  # Set log level for debugging (OFF, ERROR, INFO, DEBUG)
+  TF_LOG: "INFO"
+
+jobs:
+  terraform-plan-apply:
+    name: "Terraform Plan & Apply"
+    runs-on: ubuntu-latest
+
+    # Set permissions for the GITHUB_TOKEN
+    permissions:
+      contents: read
+      pull-requests: write  # Allows posting plan outputs as PR comments (future enhancement)
+
+    steps:
+      # Step 1: Checkout the repository code
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Step 2: Upload configuration to Terraform Cloud
+      - name: Upload Configuration
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.3.2
+        id: upload
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          directory: "."  # Upload from repository root
+          # speculative: false (default) - this is a real run, not just a plan-only test
+
+      # Step 2b: Check for concurrent runs
+      - name: Check for Concurrent Runs
+        id: concurrent-check
+        run: |
+          echo "🔍 Checking for other active runs in workspace..."
+
+          # Get workspace ID first
+          WORKSPACE_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
+
+          WORKSPACE_ID=$(echo "$WORKSPACE_DATA" | jq -r '.data.id')
+
+          # Get current runs for this workspace
+          RUNS_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/workspaces/$WORKSPACE_ID/runs?page%5Bsize%5D=5")
+
+          # Check for runs in active states (not completed/errored/canceled/discarded)
+          ACTIVE_RUNS=$(echo "$RUNS_DATA" | jq -r '
+            [.data[] | select(
+              .attributes.status != "applied" and
+              .attributes.status != "discarded" and
+              .attributes.status != "canceled" and
+              .attributes.status != "errored" and
+              .attributes.status != "planned_and_finished"
+            )] | length
+          ')
+
+          echo "Active runs found: $ACTIVE_RUNS"
+
+          if [ "$ACTIVE_RUNS" -gt 0 ]; then
+            echo ""
+            echo "⚠️  WARNING: $ACTIVE_RUNS active run(s) detected in workspace"
+            echo ""
+
+            # Show details of active runs
+            echo "$RUNS_DATA" | jq -r '
+              .data[] | select(
+                .attributes.status != "applied" and
+                .attributes.status != "discarded" and
+                .attributes.status != "canceled" and
+                .attributes.status != "errored" and
+                .attributes.status != "planned_and_finished"
+              ) | "  • Run \(.id): \(.attributes.status) (created: \(.attributes."created-at"))"
+            '
+
+            echo ""
+            echo "⏳ Workspace may be locked or queued."
+            echo "This run will likely wait in queue until previous runs complete."
+            echo ""
+            echo "::warning::Concurrent runs detected - this run may queue"
+          else
+            echo "✅ No concurrent runs - proceeding"
+          fi
+
+      # Step 3: Create a run (triggers plan)
+      - name: Create Run
+        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.3.2
+        id: create-run
+        continue-on-error: true
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          configuration_version: ${{ steps.upload.outputs.configuration_version_id }}
+          message: |
+            Triggered by @${{ github.actor }} via ${{ github.event_name }}
+
+            ${{ github.event.head_commit.message || 'Manual workflow dispatch' }}
+
+            Commit: ${{ github.sha }}
+          # plan_only: false (default) - allow this run to be applied
+          # is_destroy: false (default) - this is a normal apply, not a destroy
+          # continue-on-error: true - don't fail if status is post_plan_awaiting_decision (soft-mandatory policy override needed)
+
+      # Step 3b: Validate create-run outcome
+      - name: Validate Create Run Status
+        if: steps.create-run.conclusion == 'failure'
+        run: |
+          RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+          RUN_ID="${{ steps.create-run.outputs.run_id }}"
+
+          echo "::group::Create Run Error Analysis"
+          echo "Run Status: $RUN_STATUS"
+          echo "Run ID: $RUN_ID"
+          echo "Plan Status: ${{ steps.create-run.outputs.plan_status }}"
+          echo "::endgroup::"
+
+          # Check if run was even created
+          if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
+            echo "::error::❌ Failed to create run in TFC"
+            echo "::error::This typically indicates:"
+            echo "::error::  - Workspace is locked by another operation"
+            echo "::error::  - Insufficient permissions"
+            echo "::error::  - TFC API issue"
+            echo ""
+            echo "Check the concurrent runs warning above - workspace may be locked."
+            exit 1
+          fi
+
+          # These are EXPECTED statuses when soft-mandatory policies fail
+          if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
+            echo "::notice::✅ Run is paused for policy override - this is expected behavior for soft-mandatory policies"
+            echo "::notice::📋 Plan completed successfully, waiting for policy override decision"
+          else
+            # This is an ACTUAL error
+            echo "::error::❌ Unexpected run status: $RUN_STATUS"
+            echo "::error::This is not a policy override state - the run has failed"
+            exit 1
+          fi
+
+      # Step 4: Get plan output to check if changes exist
+      - name: Get Plan Output
+        uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.3.2
+        id: plan-output
+        if: always() && steps.create-run.outputs.plan_id != ''
+        with:
+          plan: ${{ steps.create-run.outputs.plan_id }}
+
+      # Step 4b: Get detailed run information (includes Sentinel policy checks)
+      - name: Get Run Details
+        uses: hashicorp/tfc-workflows-github/actions/show-run@v1.3.2
+        id: run-details
+        if: always() && steps.create-run.outputs.run_id != ''
+        with:
+          run: ${{ steps.create-run.outputs.run_id }}
+
+      # Step 4c: Fetch and display Sentinel policy evaluation results
+      - name: Fetch Policy Evaluation Results
+        if: always()
+        id: policy-checks
+        continue-on-error: true
+        run: |
+          echo "::group::Sentinel Policy Evaluation Results"
+
+          # Step 1: Get task stages for this run
+          TASK_STAGES=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/runs/${{ steps.create-run.outputs.run_id }}/task-stages")
+
+          # Find task stages with policy evaluations
+          POLICY_STAGE_IDS=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.relationships."policy-evaluations".data != null and (.relationships."policy-evaluations".data | length) > 0) | .id')
+
+          if [ -z "$POLICY_STAGE_IDS" ]; then
+            echo "ℹ️  No Sentinel policy evaluations configured for this workspace"
+            echo "policy_count=0" >> $GITHUB_OUTPUT
+            echo "policies_enabled=false" >> $GITHUB_OUTPUT
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          echo "✅ Sentinel policy evaluations detected"
+          echo ""
+
+          # Step 2: For each task stage with policies, get the policy evaluations
+          TOTAL_EVALUATIONS=0
+          TOTAL_PASSED=0
+          TOTAL_ADVISORY_FAILED=0
+          TOTAL_MANDATORY_FAILED=0
+          TOTAL_ERRORED=0
+
+          for STAGE_ID in $POLICY_STAGE_IDS; do
+            POLICY_EVALS=$(curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2/task-stages/$STAGE_ID/policy-evaluations")
+
+            # Parse evaluation results
+            echo "$POLICY_EVALS" | jq -r '.data[] | "📋 Policy Evaluation: \(.id)\n   Status: \(.attributes.status)\n   Policy Engine: \(.attributes."policy-kind")\n   Results:\n     • Passed: \(.attributes."result-count".passed)\n     • Advisory Failed: \(.attributes."result-count"."advisory-failed")\n     • Mandatory Failed: \(.attributes."result-count"."mandatory-failed")\n     • Errored: \(.attributes."result-count".errored)\n"'
+
+            # Aggregate counts separately by type
+            EVAL_COUNT=$(echo "$POLICY_EVALS" | jq -r '.data | length')
+            PASSED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count".passed] | add // 0')
+            ADV_FAILED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count"."advisory-failed"] | add // 0')
+            MAND_FAILED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count"."mandatory-failed"] | add // 0')
+            ERRORED=$(echo "$POLICY_EVALS" | jq -r '[.data[].attributes."result-count".errored] | add // 0')
+
+            TOTAL_EVALUATIONS=$((TOTAL_EVALUATIONS + EVAL_COUNT))
+            TOTAL_PASSED=$((TOTAL_PASSED + PASSED))
+            TOTAL_ADVISORY_FAILED=$((TOTAL_ADVISORY_FAILED + ADV_FAILED))
+            TOTAL_MANDATORY_FAILED=$((TOTAL_MANDATORY_FAILED + MAND_FAILED))
+            TOTAL_ERRORED=$((TOTAL_ERRORED + ERRORED))
+          done
+
+          echo ""
+          echo "📊 Summary:"
+          echo "   Total Policy Evaluations: $TOTAL_EVALUATIONS"
+          echo "   Policies Passed: $TOTAL_PASSED"
+          echo "   Advisory Failed: $TOTAL_ADVISORY_FAILED"
+          echo "   Mandatory Failed: $TOTAL_MANDATORY_FAILED"
+          echo "   Errored: $TOTAL_ERRORED"
+          echo ""
+          echo "ℹ️  Detailed policy results available in Terraform Cloud"
+          echo "   View at: ${{ steps.create-run.outputs.run_link }}"
+
+          # Save for summary
+          echo "policy_count=$TOTAL_EVALUATIONS" >> $GITHUB_OUTPUT
+          echo "policies_enabled=true" >> $GITHUB_OUTPUT
+          echo "policies_passed=$TOTAL_PASSED" >> $GITHUB_OUTPUT
+          echo "policies_advisory_failed=$TOTAL_ADVISORY_FAILED" >> $GITHUB_OUTPUT
+          echo "policies_mandatory_failed=$TOTAL_MANDATORY_FAILED" >> $GITHUB_OUTPUT
+          echo "policies_errored=$TOTAL_ERRORED" >> $GITHUB_OUTPUT
+
+          echo "::endgroup::"
+
+      # Step 4d: Check for policy override requirements
+      - name: Check Policy Override Status
+        if: always()
+        id: policy-override
+        continue-on-error: true
+        run: |
+          # Check if any mandatory policies failed
+          MANDATORY_FAILED=${{ steps.policy-checks.outputs.policies_mandatory_failed }}
+
+          if [ "$MANDATORY_FAILED" -gt 0 ]; then
+            echo "::warning::⚠️ $MANDATORY_FAILED mandatory policy failure(s) detected"
+            echo "::warning::🔗 Override in TFC: ${{ steps.create-run.outputs.run_link }}"
+            echo "::warning::⏰ Apply step will wait up to 1 hour for manual override"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🚨 MANDATORY POLICY FAILURE - MANUAL OVERRIDE REQUIRED"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "📊 Failed Policies: $MANDATORY_FAILED"
+            echo "🔗 TFC Run URL: ${{ steps.create-run.outputs.run_link }}"
+            echo ""
+            echo "⏳ NEXT STEPS:"
+            echo "   1. Review policy failures in TFC UI"
+            echo "   2. Click 'Override & Continue' button (if soft-mandatory)"
+            echo "   3. Provide justification for override"
+            echo "   4. Workflow will automatically continue after override"
+            echo ""
+            echo "⚠️  If not overridden within $TF_MAX_TIMEOUT (default: 1h),"
+            echo "   the apply step will timeout and workflow will fail."
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "requires_override=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ No mandatory policy failures - proceeding with apply"
+            echo "requires_override=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 4e: Check workspace auto-apply setting
+      - name: Check Workspace Configuration
+        if: steps.policy-override.outputs.requires_override == 'true'
+        run: |
+          echo "🔍 Checking workspace configuration..."
+
+          # Get workspace details
+          WORKSPACE_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
+
+          AUTO_APPLY=$(echo "$WORKSPACE_DATA" | jq -r '.data.attributes."auto-apply"')
+
+          echo "Workspace auto-apply setting: $AUTO_APPLY"
+
+          if [[ "$AUTO_APPLY" == "true" ]]; then
+            echo ""
+            echo "::notice::⚡ Workspace has auto-apply enabled"
+            echo "After policy override, TFC will automatically queue the apply."
+            echo "This workflow will detect the auto-apply and skip the API apply call."
+          else
+            echo ""
+            echo "::notice::✋ Workspace has manual apply (auto-apply: false)"
+            echo "After policy override, this workflow will trigger apply via API."
+            echo ""
+            echo "💡 Expected workflow:"
+            echo "   1. Override policy in TFC (provide justification)"
+            echo "   2. DO NOT click 'Confirm & Apply' in TFC"
+            echo "   3. This workflow will automatically trigger apply"
+          fi
+
+      # Step 5: Wait for policy override if required
+      - name: Wait for Policy Override
+        id: wait-for-override
+        if: steps.policy-override.outputs.requires_override == 'true'
+        run: |
+          # ============================================================================
+          # HELPER FUNCTIONS
+          # ============================================================================
+
+          # Function: Call TFC API with consistent auth headers
+          tfc_api_call() {
+            local endpoint=$1
+            curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2${endpoint}"
+          }
+
+          # Function: Extract override details from run data and comments
+          extract_override_details() {
+            local run_id=$1
+
+            # Fetch override comment from comments API
+            local comments_data=$(tfc_api_call "/runs/$run_id/comments")
+            local override_comment=$(echo "$comments_data" | jq -r '.data[-1].attributes.body // "No comment provided"')
+
+            # Output to GitHub Actions output
+            {
+              echo "override_comment<<EOF"
+              echo "$override_comment"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          }
+
+          # Function: Classify run status into actionable categories
+          classify_run_status() {
+            local status=$1
+
+            case $status in
+              post_plan_awaiting_decision)
+                echo "waiting_override"
+                ;;
+              policy_override|post_plan_completed)
+                echo "override_complete"
+                ;;
+              apply_queued)
+                echo "apply_queued"
+                ;;
+              applying)
+                echo "applying"
+                ;;
+              applied)
+                echo "applied"
+                ;;
+              discarded)
+                echo "discarded"
+                ;;
+              canceled|force_canceled)
+                echo "canceled"
+                ;;
+              errored)
+                echo "errored"
+                ;;
+              *)
+                echo "unknown"
+                ;;
+            esac
+          }
+
+          # ============================================================================
+          # MAIN LOGIC
+          # ============================================================================
+
+          echo "⏸️ Run is awaiting policy override..."
+          echo ""
+          echo "🔗 Override in TFC: ${{ steps.create-run.outputs.run_link }}"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋 POLICY OVERRIDE WORKFLOW"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "This workflow will wait up to 1 hour for you to:"
+          echo "  1. 🔗 Open the run in Terraform Cloud (link above)"
+          echo "  2. 📋 Review the policy failure details"
+          echo "  3. ✅ Click 'Override & Continue' button"
+          echo "  4. 📝 Provide justification for the override"
+          echo "  5. ⏸️  DO NOT click 'Confirm & Apply' in TFC"
+          echo ""
+          echo "After you override the policy, this workflow will"
+          echo "automatically trigger the apply via API (maintaining"
+          echo "the GitOps workflow and audit trail in GitHub Actions)."
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+
+          # Poll TFC API for run status change
+          MAX_WAIT=3600  # 1 hour in seconds
+          POLL_INTERVAL=30  # Check every 30 seconds
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Get current run status using helper function
+            RUN_DATA=$(tfc_api_call "/runs/${{ steps.create-run.outputs.run_id }}")
+            CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
+            STATUS_CLASS=$(classify_run_status "$CURRENT_STATUS")
+
+            echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS (classified as: $STATUS_CLASS)"
+
+            # Handle different status classifications
+            case $STATUS_CLASS in
+              override_complete|apply_queued)
+                # Override detected - ready for API apply
+                echo ""
+                echo "✅ Policy override detected! Run status: $CURRENT_STATUS"
+                echo "Override complete - workflow will now trigger apply via API..."
+
+                # Extract override details using helper function
+                extract_override_details "${{ steps.create-run.outputs.run_id }}"
+
+                # Mark as ready for API apply
+                echo "override_detected=true" >> $GITHUB_OUTPUT
+                echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+
+              applying|applied)
+                # Manual apply detected
+                echo ""
+                echo "⚠️  Apply was manually triggered in TFC UI (status: $CURRENT_STATUS)"
+                echo "For proper workflow control, after override, let the GitHub Actions workflow trigger the apply."
+                echo "Skipping apply-run step since apply is already in progress/done."
+
+                # Extract override details
+                extract_override_details "${{ steps.create-run.outputs.run_id }}"
+
+                # Mark as manually applied
+                echo "override_detected=true" >> $GITHUB_OUTPUT
+                echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+
+              discarded)
+                # Run was discarded
+                echo ""
+                echo "🗑️  Run was discarded - user chose not to proceed"
+                echo "No infrastructure changes have been applied."
+                echo "This is not an error - the run was intentionally discarded."
+                echo ""
+                echo "If you want to proceed with these changes:"
+                echo "  1. Review and update your code if needed"
+                echo "  2. Commit and push to trigger a new run"
+                echo "run_discarded=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+
+              canceled)
+                # Run was canceled
+                echo ""
+                echo "⛔ Run was canceled manually in TFC"
+                echo "Status: $CURRENT_STATUS"
+                echo ""
+                echo "Cancellation can occur if:"
+                echo "  - User clicked 'Cancel Run' in TFC UI"
+                echo "  - Workspace admin force-canceled the run"
+                echo "  - Run exceeded workspace timeout limits"
+                echo ""
+                echo "run_canceled=true" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+
+              errored)
+                # Run errored
+                echo ""
+                echo "❌ Run ended with error status"
+                echo "This typically indicates:"
+                echo "  - Policy evaluation error"
+                echo "  - TFC internal error"
+                echo "  - Workspace configuration issue"
+                echo ""
+                echo "Check run details: ${{ steps.create-run.outputs.run_link }}"
+                exit 1
+                ;;
+
+              waiting_override)
+                # Still waiting - continue polling
+                ;;
+
+              *)
+                # Unknown status
+                echo ""
+                echo "⚠️  Unknown run status: $CURRENT_STATUS"
+                echo "Continuing to wait..."
+                ;;
+            esac
+
+            # Still waiting...
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          # Timeout reached
+          echo ""
+          echo "::error::⏱️ Timeout: No policy override detected after 1 hour"
+          echo "::error::Please override the policy in TFC or update your code to comply"
+          exit 1
+
+      # Step 6: Apply the run (only if there are changes and not already applied manually or discarded)
+      - name: Apply Run
+        uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.3.2
+        id: apply
+        if: |
+          (steps.plan-output.outputs.add != '0' || steps.plan-output.outputs.change != '0' || steps.plan-output.outputs.destroy != '0') &&
+          steps.wait-for-override.outputs.manual_apply_completed != 'true' &&
+          steps.wait-for-override.outputs.run_discarded != 'true' &&
+          steps.wait-for-override.outputs.run_canceled != 'true'
+        with:
+          run: ${{ steps.create-run.outputs.run_id }}
+          comment: |
+            Auto-applied by @${{ github.actor }} via GitHub Actions (Run #${{ github.run_number }})
+
+            Commit: ${{ github.event.head_commit.message || 'Manual workflow dispatch' }}
+        # Note: This step is skipped if:
+        #   1. No infrastructure changes detected, OR
+        #   2. Run was already manually applied in TFC UI after policy override
+
+      # Step 6b: Manual apply detected message
+      - name: Manual Apply Detected
+        if: steps.wait-for-override.outputs.manual_apply_completed == 'true'
+        run: |
+          echo "::warning::⚠️ Apply was triggered manually in TFC UI"
+          echo ""
+          echo "The run is already being applied or has been applied in Terraform Cloud."
+          echo "Skipping apply-run API call to avoid conflict."
+          echo ""
+          echo "💡 Best Practice: After overriding a policy in TFC, wait for this"
+          echo "   workflow to trigger the apply via API. This maintains the full"
+          echo "   GitOps audit trail in GitHub Actions."
+          echo ""
+          echo "   Expected workflow:"
+          echo "   1. Override policy in TFC (provide justification)"
+          echo "   2. DO NOT click 'Confirm & Apply' in TFC"
+          echo "   3. Let this workflow automatically trigger the apply"
+          echo ""
+          echo "🔗 View results: ${{ steps.create-run.outputs.run_link }}"
+
+      # Step 6c: Run discarded message
+      - name: Run Discarded
+        if: steps.wait-for-override.outputs.run_discarded == 'true'
+        run: |
+          echo "::notice::🗑️ Run was discarded in TFC"
+          echo ""
+          echo "The run was intentionally discarded - no infrastructure changes applied."
+          echo "This is not an error. Skipping apply step."
+          echo ""
+          echo "🔗 Discarded run: ${{ steps.create-run.outputs.run_link }}"
+
+      # Step 7: Skip message when no changes
+      - name: No Changes Detected
+        if: steps.plan-output.outputs.add == '0' && steps.plan-output.outputs.change == '0' && steps.plan-output.outputs.destroy == '0'
+        run: |
+          echo "::notice::No infrastructure changes detected. Skipping apply step."
+          echo "Plan showed 0 resources to add, change, or destroy."
+
+      # Step 8: Create workflow summary
+      - name: Create Workflow Summary
+        if: always()
+        run: |
+          echo "# 🚀 Terraform Cloud API Workflow" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Status badge at the top
+          RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+          MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
+          RUN_DISCARDED="${{ steps.wait-for-override.outputs.run_discarded }}"
+          RUN_CANCELED="${{ steps.wait-for-override.outputs.run_canceled }}"
+
+          if [[ "$RUN_DISCARDED" == "true" ]]; then
+            echo "## 🗑️ Run Discarded" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_CANCELED" == "true" ]]; then
+            echo "## ⛔ Run Canceled" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$MANUAL_APPLY" == "true" ]]; then
+            echo "## ⚠️ Applied Manually in TFC" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
+            echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
+            echo "## ✨ No Changes Required" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
+            echo "## ⏸️ Awaiting Policy Override" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.outputs.status }}" == "Error" ]; then
+            echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ Deployment Status: ${{ steps.apply.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Workflow metadata
+          echo "### 📋 Run Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Organization** | \`${{ env.TF_CLOUD_ORGANIZATION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered By** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Event** | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workflow Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Terraform Cloud run info
+          echo "### ☁️ Terraform Cloud Run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | \`${{ steps.create-run.outputs.run_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Plan ID** | \`${{ steps.create-run.outputs.plan_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Configuration Version** | \`${{ steps.upload.outputs.configuration_version_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Plan Status** | \`${{ steps.create-run.outputs.plan_status }}\` |" >> $GITHUB_STEP_SUMMARY
+
+          # Determine apply status based on different scenarios
+          if [[ "$RUN_DISCARDED" == "true" ]]; then
+            echo "| **Apply Status** | \`Discarded\` |" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_CANCELED" == "true" ]]; then
+            echo "| **Apply Status** | \`Canceled\` |" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$MANUAL_APPLY" == "true" ]]; then
+            echo "| **Apply Status** | \`Applied manually in TFC\` |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
+            # Check WHY it was skipped
+            if [ "${{ steps.plan-output.outputs.add }}" == "0" ] && [ "${{ steps.plan-output.outputs.change }}" == "0" ] && [ "${{ steps.plan-output.outputs.destroy }}" == "0" ]; then
+              echo "| **Apply Status** | \`Skipped (no changes)\` |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| **Apply Status** | \`Skipped\` |" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "| **Apply Status** | \`${{ steps.apply.outputs.status }}\` |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Plan changes summary
+          echo "### 📊 Infrastructure Changes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Change Type | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ➕ Resources to Add | ${{ steps.plan-output.outputs.add }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔄 Resources to Change | ${{ steps.plan-output.outputs.change }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ➖ Resources to Destroy | ${{ steps.plan-output.outputs.destroy }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Sentinel policy evaluation section
+          if [ "${{ steps.policy-checks.outputs.policies_enabled }}" == "true" ]; then
+            echo "### 🛡️ Sentinel Policy Evaluations" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Result Type | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ **Passed** | ${{ steps.policy-checks.outputs.policies_passed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚠️ **Failed (Advisory)** | ${{ steps.policy-checks.outputs.policies_advisory_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🚫 **Failed (Mandatory)** | ${{ steps.policy-checks.outputs.policies_mandatory_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ **Errored** | ${{ steps.policy-checks.outputs.policies_errored }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Show warning or override details if mandatory policies failed
+            if [ "${{ steps.wait-for-override.outputs.override_detected }}" == "true" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "#### 🛡️ Policy Override Details" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Justification:**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> ${{ steps.wait-for-override.outputs.override_comment }}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> 📝 **Audit Trail**: Policy override decision recorded. All overrides are logged in Terraform Cloud for compliance review." >> $GITHUB_STEP_SUMMARY
+            elif [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
+              echo "> ⚠️ **Action Required**: ${{ steps.policy-checks.outputs.policies_mandatory_failed }} mandatory policies failed. If these are **soft-mandatory** policies, you can override them in the [Terraform Cloud UI](${{ steps.create-run.outputs.run_link }}). If they are **hard-mandatory**, you must fix the code to comply." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "> 💡 **Policy Governance**: Sentinel policies validate configuration compliance even when no infrastructure changes are detected. View detailed policy results in the Terraform Cloud run." >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Links section
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 [View Run in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 [Workspace Overview](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📝 [Workspace Variables](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/variables)" >> $GITHUB_STEP_SUMMARY
+          echo "- 🛡️ [Policy Sets](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/settings/policy-sets)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚙️ [Workspace Settings](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/settings/general)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Conditional success/failure message
+          # Check if override wait step failed (timeout)
+          OVERRIDE_WAIT_CONCLUSION="${{ steps.wait-for-override.conclusion }}"
+
+          # Check if manual apply was completed in TFC
+          MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
+
+          if [[ "$RUN_DISCARDED" == "true" ]]; then
+            echo "### 🗑️ Run Was Discarded" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The run was intentionally discarded in Terraform Cloud. No infrastructure changes were applied." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**What Happened:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 Configuration uploaded to Terraform Cloud" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 Plan completed (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. 🛡️ Sentinel policy failed (soft-mandatory)" >> $GITHUB_STEP_SUMMARY
+            echo "4. ⏸️ Workflow waited for policy override" >> $GITHUB_STEP_SUMMARY
+            echo "5. 🗑️ Run was discarded (intentional choice not to proceed)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Not an Error**: Discarding a run is a valid workflow. If you want to proceed with these changes, update your code (if needed) and commit again to trigger a new run." >> $GITHUB_STEP_SUMMARY
+          elif [[ "$RUN_CANCELED" == "true" ]]; then
+            echo "### ⛔ Run Was Canceled" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The run was canceled manually in Terraform Cloud." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Possible Reasons:**" >> $GITHUB_STEP_SUMMARY
+            echo "- User clicked 'Cancel Run' in TFC UI" >> $GITHUB_STEP_SUMMARY
+            echo "- Workspace admin force-canceled the run" >> $GITHUB_STEP_SUMMARY
+            echo "- Run exceeded workspace timeout limits" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 🔗 Review the [run details in TFC](${{ steps.create-run.outputs.run_link }}) to see why it was canceled." >> $GITHUB_STEP_SUMMARY
+          elif [[ "$OVERRIDE_WAIT_CONCLUSION" == "failure" ]]; then
+            echo "### ⏱️ Policy Override Timeout" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The workflow waited 1 hour for a policy override but none was provided." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 🔗 Review the [policy failure in TFC](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+            echo "2. Either:" >> $GITHUB_STEP_SUMMARY
+            echo "   - Override the policy manually in TFC and trigger apply" >> $GITHUB_STEP_SUMMARY
+            echo "   - Fix your code to comply with the policy and re-run" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$MANUAL_APPLY" == "true" ]]; then
+            echo "### ⚠️ Deployment Successful (Manual Apply in TFC)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure changes were applied, but the apply was triggered **manually in TFC UI** instead of via the workflow." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**What Happened:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 Configuration uploaded to Terraform Cloud" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 Plan completed (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. 🛡️ Sentinel policy failed (soft-mandatory)" >> $GITHUB_STEP_SUMMARY
+            echo "4. ⏸️ Workflow waited for policy override" >> $GITHUB_STEP_SUMMARY
+            echo "5. ✅ You overrode the policy in TFC" >> $GITHUB_STEP_SUMMARY
+            echo "6. ⚠️ You also clicked \"Confirm & Apply\" in TFC (should wait for workflow)" >> $GITHUB_STEP_SUMMARY
+            echo "7. ⏭️ Workflow skipped API apply to avoid conflict" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Best Practice**: After overriding a policy, let the workflow trigger the apply via API to maintain full GitOps audit trail in GitHub Actions. Only override the policy in TFC, then let the workflow proceed automatically." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.outputs.status }}" == "Success" ]; then
+            echo "### 🎉 What Happened?" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure changes have been successfully applied! The Terraform configuration was:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 **Uploaded** to Terraform Cloud as configuration version \`${{ steps.upload.outputs.configuration_version_id }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 **Planned** by Terraform Cloud (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. ✅ **Applied** successfully with all changes committed to your infrastructure" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **API-Driven Workflow**: This deployment used Terraform Cloud's API, not the CLI. All execution happened in TFC's secure environment." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.apply.conclusion }}" == "skipped" ]; then
+            echo "### ✨ What Happened?" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Your infrastructure is already up to date! The Terraform configuration was:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. 📤 **Uploaded** to Terraform Cloud as configuration version \`${{ steps.upload.outputs.configuration_version_id }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📋 **Planned** by Terraform Cloud (run \`${{ steps.create-run.outputs.run_id }}\`)" >> $GITHUB_STEP_SUMMARY
+            echo "3. ⏭️ **Apply skipped** - plan showed 0 resources to add, change, or destroy" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> 💡 **Infrastructure Drift Check**: No changes were needed, confirming your infrastructure matches your code—a valuable validation!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Action Required" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The apply step encountered an issue. Please review the following:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check the [run details in Terraform Cloud](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+            echo "2. Review the plan output above for any errors" >> $GITHUB_STEP_SUMMARY
+            echo "3. Verify workspace variables and provider credentials" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Status**: \`${{ steps.apply.outputs.status }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by [GitHub Actions](${{ github.server_url }}/${{ github.repository }}) using [tfc-workflows-github](https://github.com/hashicorp/tfc-workflows-github)*" >> $GITHUB_STEP_SUMMARY
+
+      # Step 9: Handle failures
+      - name: Check Workflow Status
+        if: steps.apply.conclusion == 'failure' || steps.wait-for-override.conclusion == 'failure'
+        run: |
+          # Check if policy override wait failed (timeout)
+          if [[ "${{ steps.wait-for-override.conclusion }}" == "failure" ]]; then
+            echo "::error::Policy override timeout - workflow failed waiting for override"
+            exit 1
+          fi
+
+          # Check if apply failed
+          if [[ "${{ steps.apply.conclusion }}" == "failure" ]]; then
+            echo "::error::Terraform apply failed with status: ${{ steps.apply.outputs.status }}"
+            exit 1
+          fi
