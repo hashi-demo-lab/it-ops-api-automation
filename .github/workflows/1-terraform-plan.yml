@@ -1,0 +1,180 @@
+name: "1. Terraform Plan"
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Run message for TFC'
+        required: false
+        default: 'Triggered from GitHub Actions - Plan workflow'
+  push:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '.github/workflows/1-terraform-plan.yml'
+
+env:
+  TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+  TF_WORKSPACE: ${{ vars.TF_WORKSPACE }}
+
+jobs:
+  terraform-plan:
+    name: "Create Terraform Plan"
+    runs-on: ubuntu-latest
+
+    outputs:
+      run_id: ${{ steps.create-run.outputs.run_id }}
+      plan_id: ${{ steps.create-run.outputs.plan_id }}
+      run_status: ${{ steps.create-run.outputs.run_status }}
+      run_link: ${{ steps.create-run.outputs.run_link }}
+      add: ${{ steps.plan-output.outputs.add }}
+      change: ${{ steps.plan-output.outputs.change }}
+      destroy: ${{ steps.plan-output.outputs.destroy }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Upload Configuration Version
+        id: upload-config
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.3.2
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          directory: ./
+
+      - name: Check for Concurrent Runs
+        id: concurrent-check
+        run: |
+          # Get workspace ID first
+          WORKSPACE_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
+
+          WORKSPACE_ID=$(echo "$WORKSPACE_DATA" | jq -r '.data.id')
+
+          # Get current runs for this workspace
+          RUNS_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/workspaces/$WORKSPACE_ID/runs?page%5Bsize%5D=5")
+
+          # Check for runs in active states
+          ACTIVE_RUNS=$(echo "$RUNS_DATA" | jq -r '
+            [.data[] | select(
+              .attributes.status != "applied" and
+              .attributes.status != "discarded" and
+              .attributes.status != "canceled" and
+              .attributes.status != "errored" and
+              .attributes.status != "planned_and_finished"
+            )] | length
+          ')
+
+          if [ "$ACTIVE_RUNS" -gt 0 ]; then
+            echo "⚠️  WARNING: $ACTIVE_RUNS active run(s) detected in workspace"
+            echo "This run may queue behind existing runs."
+            echo "::warning::Concurrent runs detected - this run may queue"
+          else
+            echo "✅ No concurrent runs detected"
+          fi
+
+      - name: Create Run
+        id: create-run
+        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.3.2
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          configuration_version: ${{ steps.upload-config.outputs.configuration_version_id }}
+          message: ${{ github.event.inputs.message || format('Plan from commit {0}', github.sha) }}
+
+      - name: Validate Create Run Status
+        if: steps.create-run.conclusion == 'failure'
+        run: |
+          RUN_STATUS="${{ steps.create-run.outputs.run_status }}"
+          RUN_ID="${{ steps.create-run.outputs.run_id }}"
+
+          # Check if run was even created
+          if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
+            echo "::error::❌ Failed to create run in TFC"
+            echo "::error::This typically indicates:"
+            echo "::error::  - Workspace is locked by another operation"
+            echo "::error::  - Insufficient permissions"
+            echo "::error::  - TFC API issue"
+            exit 1
+          fi
+
+          # These are EXPECTED statuses when soft-mandatory policies fail
+          if [[ "$RUN_STATUS" == "post_plan_awaiting_decision" ]] || [[ "$RUN_STATUS" == "policy_override" ]]; then
+            echo "::notice::✅ Run is paused for policy override - this is expected"
+            echo "::notice::Run will be evaluated in the Policy Check workflow"
+          else
+            echo "::error::❌ Unexpected run status: $RUN_STATUS"
+            exit 1
+          fi
+
+      - name: Get Plan Output
+        id: plan-output
+        if: always() && steps.create-run.outputs.plan_id != ''
+        uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.3.2
+        with:
+          plan: ${{ steps.create-run.outputs.plan_id }}
+
+      - name: Get Run Details
+        id: run-details
+        if: always() && steps.create-run.outputs.run_id != ''
+        run: |
+          RUN_DATA=$(curl -s \
+            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/runs/${{ steps.create-run.outputs.run_id }}")
+
+          echo "run_data=$RUN_DATA" >> $GITHUB_OUTPUT
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "# 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Status section
+          echo "### 🎯 Plan Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Attribute | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workflow** | 1. Terraform Plan |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | \`${{ steps.create-run.outputs.run_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Plan ID** | \`${{ steps.create-run.outputs.plan_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | \`${{ steps.create-run.outputs.run_status }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Plan changes
+          if [ "${{ steps.plan-output.conclusion }}" == "success" ]; then
+            echo "### 📊 Infrastructure Changes" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Change Type | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| ➕ Resources to Add | ${{ steps.plan-output.outputs.add }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔄 Resources to Change | ${{ steps.plan-output.outputs.change }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ➖ Resources to Destroy | ${{ steps.plan-output.outputs.destroy }} |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Next steps
+          echo "### ⏭️ Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Policy Check**: Run the \`2-sentinel-policy-check\` workflow to evaluate Sentinel policies" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Review**: Check [TFC Run](${{ steps.create-run.outputs.run_link }}) for detailed plan output" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Apply**: After policy approval, run the \`3-terraform-apply\` workflow" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Links
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Run in TFC](${{ steps.create-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Workspace: ${{ env.TF_WORKSPACE }}](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Metadata
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by GitHub Actions | Commit: \`${GITHUB_SHA:0:7}\` | Workflow: Terraform Plan*" >> $GITHUB_STEP_SUMMARY
