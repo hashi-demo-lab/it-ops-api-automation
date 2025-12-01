@@ -160,17 +160,40 @@ jobs:
           # Get run details to find policy check
           RUN_DATA=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}")
 
-          # Get the policy check ID from the run relationships
+          # Debug: Show what relationships exist
+          echo "DEBUG: Available relationships:"
+          echo "$RUN_DATA" | jq -c '.data.relationships | keys'
+          echo ""
+
+          # Try policy-checks first (legacy)
           POLICY_CHECK_ID=$(echo "$RUN_DATA" | jq -r '.data.relationships."policy-checks".data[0].id // empty')
 
+          # If no policy-checks, try task-stages (newer policy evaluations)
           if [[ -z "$POLICY_CHECK_ID" || "$POLICY_CHECK_ID" == "null" ]]; then
-            echo "::error::No policy check found for this run"
-            echo "::error::This run may not have policy checks configured"
-            exit 1
-          fi
+            echo "No legacy policy-checks found, checking task-stages..."
 
-          echo "Policy Check ID: $POLICY_CHECK_ID"
-          echo "policy_check_id=$POLICY_CHECK_ID" >> $GITHUB_OUTPUT
+            # Get task stages
+            TASK_STAGES=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}/task-stages")
+
+            echo "DEBUG: Task stages:"
+            echo "$TASK_STAGES" | jq -c '.data[] | {id: .id, stage: .attributes.stage}'
+
+            # Get the post_plan stage which contains policy evaluations
+            POLICY_STAGE_ID=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan") | .id' | head -n1)
+
+            if [[ -n "$POLICY_STAGE_ID" && "$POLICY_STAGE_ID" != "null" ]]; then
+              echo "Found policy stage: $POLICY_STAGE_ID"
+              echo "policy_stage_id=$POLICY_STAGE_ID" >> $GITHUB_OUTPUT
+              echo "using_policy_evaluations=true" >> $GITHUB_OUTPUT
+            else
+              echo "::error::No policy checks or evaluations found for this run"
+              exit 1
+            fi
+          else
+            echo "Policy Check ID: $POLICY_CHECK_ID"
+            echo "policy_check_id=$POLICY_CHECK_ID" >> $GITHUB_OUTPUT
+            echo "using_policy_evaluations=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Apply Override
         id: override
@@ -180,12 +203,25 @@ jobs:
           echo "Justification: ${{ github.event.inputs.justification }}"
           echo ""
 
-          # Apply override to the policy check
+          # Determine which override endpoint to use
+          if [[ "${{ steps.get-policy-check.outputs.using_policy_evaluations }}" == "true" ]]; then
+            # Use task-stage override (newer policy evaluations)
+            echo "Using task-stage override endpoint..."
+            OVERRIDE_URL="https://app.terraform.io/api/v2/task-stages/${{ steps.get-policy-check.outputs.policy_stage_id }}/actions/override"
+          else
+            # Use policy-check override (legacy)
+            echo "Using policy-check override endpoint..."
+            OVERRIDE_URL="https://app.terraform.io/api/v2/policy-checks/${{ steps.get-policy-check.outputs.policy_check_id }}/actions/override"
+          fi
+
+          echo "Override URL: $OVERRIDE_URL"
+
+          # Apply override
           OVERRIDE_RESPONSE=$(curl -s -w "\n%{http_code}" \
             --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
             --header "Content-Type: application/vnd.api+json" \
             --request POST \
-            "https://app.terraform.io/api/v2/policy-checks/${{ steps.get-policy-check.outputs.policy_check_id }}/actions/override")
+            "$OVERRIDE_URL")
 
           # Extract HTTP status code and body
           HTTP_CODE=$(echo "$OVERRIDE_RESPONSE" | tail -n1)
