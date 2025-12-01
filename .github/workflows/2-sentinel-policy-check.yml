@@ -68,6 +68,9 @@ jobs:
 
           RUN_ID="${{ steps.determine-run.outputs.run_id }}"
 
+          echo "🔍 Retrieving policy evaluation results..."
+          echo ""
+
           # Get run details
           RUN_DATA=$(tfc_api_call "/runs/$RUN_ID")
 
@@ -79,7 +82,7 @@ jobs:
 
           if [[ -z "$POLICY_STAGE_ID" || "$POLICY_STAGE_ID" == "null" ]]; then
             echo "policies_enabled=false" >> $GITHUB_OUTPUT
-            echo "No Sentinel policies configured for this workspace"
+            echo "ℹ️  No Sentinel policies configured for this workspace"
             exit 0
           fi
 
@@ -88,25 +91,59 @@ jobs:
           # Get policy evaluations for this stage
           POLICY_EVALS=$(tfc_api_call "/task-stages/$POLICY_STAGE_ID/policy-evaluations")
 
-          # Count policy results
-          TOTAL=$(echo "$POLICY_EVALS" | jq '[.data[].attributes.result_count] | add // 0')
-          PASSED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes.passed] | add // 0')
-          ADVISORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."advisory-failed"] | add // 0')
-          MANDATORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."mandatory-failed"] | add // 0')
-          ERRORED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes.errored] | add // 0')
+          # Get the policy evaluation ID for detailed results
+          POLICY_EVAL_ID=$(echo "$POLICY_EVALS" | jq -r '.data[0].id')
 
+          # Count policy results using the correct attribute structure
+          TOTAL=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count" | .passed + ."advisory-failed" + ."mandatory-failed" + .errored] | add // 0')
+          PASSED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count".passed] | add // 0')
+          ADVISORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count"."advisory-failed"] | add // 0')
+          MANDATORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count"."mandatory-failed"] | add // 0')
+          ERRORED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count".errored] | add // 0')
+
+          # Store detailed policy results for later display
+          echo "policy_eval_id=$POLICY_EVAL_ID" >> $GITHUB_OUTPUT
           echo "policy_count=$TOTAL" >> $GITHUB_OUTPUT
           echo "policies_passed=$PASSED" >> $GITHUB_OUTPUT
           echo "policies_advisory_failed=$ADVISORY_FAILED" >> $GITHUB_OUTPUT
           echo "policies_mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
           echo "policies_errored=$ERRORED" >> $GITHUB_OUTPUT
 
-          echo "📊 Policy Evaluation Results:"
-          echo "   Total: $TOTAL"
-          echo "   Passed: $PASSED"
-          echo "   Failed (Advisory): $ADVISORY_FAILED"
-          echo "   Failed (Mandatory): $MANDATORY_FAILED"
-          echo "   Errored: $ERRORED"
+          echo "📊 Policy Evaluation Summary:"
+          echo "   Total Policies: $TOTAL"
+          echo "   ✅ Passed: $PASSED"
+          echo "   ⚠️  Failed (Advisory): $ADVISORY_FAILED"
+          echo "   🚫 Failed (Mandatory): $MANDATORY_FAILED"
+          echo "   ❌ Errored: $ERRORED"
+          echo ""
+
+          # Get detailed policy outcomes if available
+          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
+            echo "📋 Fetching detailed policy results..."
+
+            # The policy evaluation includes relationships to policy-set-outcomes
+            # We'll extract and display individual policy results
+            POLICY_OUTCOMES=$(echo "$POLICY_EVALS" | jq -r '
+              .data[0].attributes.outcomes[] // [] |
+              "  • \(.["policy-name"] // "Unknown Policy"): \(.status // "unknown") (enforcement: \(.["enforcement-level"] // "unknown"))"
+            ')
+
+            if [[ -n "$POLICY_OUTCOMES" ]]; then
+              echo ""
+              echo "Individual Policy Results:"
+              echo "$POLICY_OUTCOMES"
+            fi
+          fi
+
+          # Save the full policy evaluation data for summary
+          {
+            echo "policy_details<<EOF"
+            echo "$POLICY_EVALS" | jq -r '
+              .data[0].attributes.outcomes[]? // [] |
+              "**\(.["policy-name"] // "Unknown")**: \(.status) (Enforcement: \(.["enforcement-level"] // "unknown"))"
+            '
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
       - name: Check if Override Required
         id: policy-override
@@ -335,6 +372,21 @@ jobs:
             echo "| ❌ **Errored** | ${{ steps.policy-checks.outputs.policies_errored }} |" >> $GITHUB_STEP_SUMMARY
             echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Show individual policy results if available
+            POLICY_DETAILS="${{ steps.policy-checks.outputs.policy_details }}"
+            if [[ -n "$POLICY_DETAILS" && "$POLICY_DETAILS" != "" ]]; then
+              echo "#### 📋 Individual Policy Results" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "$POLICY_DETAILS" | while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                  echo "- $line" >> $GITHUB_STEP_SUMMARY
+                fi
+              done
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> 💡 **Tip**: Review failed mandatory policies to determine if override is appropriate" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
 
             # Override details
             if [ "${{ steps.wait-for-override.outputs.override_detected }}" == "true" ]; then
