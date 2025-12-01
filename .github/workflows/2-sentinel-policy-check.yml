@@ -38,16 +38,25 @@ jobs:
       run_link: ${{ steps.determine-run.outputs.run_link }}
 
     steps:
+      - name: Download Run ID Artifact
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-run-data
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
       - name: Determine Run ID
         id: determine-run
         run: |
           if [ -n "${{ github.event.inputs.run_id }}" ]; then
             RUN_ID="${{ github.event.inputs.run_id }}"
             echo "📝 Using manually provided run ID: $RUN_ID"
+          elif [ -f "run_id.txt" ]; then
+            RUN_ID=$(cat run_id.txt)
+            echo "📝 Using run ID from Plan workflow: $RUN_ID"
           else
-            # Get the run ID from the Plan workflow
-            # This would need to be passed via artifact or API call
-            echo "::error::No run ID provided. Please provide run_id input."
+            echo "::error::No run ID provided. Please provide run_id input or trigger from Plan workflow."
             exit 1
           fi
 
