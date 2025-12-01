@@ -179,11 +179,32 @@ jobs:
             echo "$TASK_STAGES" | jq -c '.data[] | {id: .id, stage: .attributes.stage}'
 
             # Get the post_plan stage which contains policy evaluations
-            POLICY_STAGE_ID=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan") | .id' | head -n1)
+            POLICY_STAGE_DATA=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan")' | head -n1)
+            POLICY_STAGE_ID=$(echo "$POLICY_STAGE_DATA" | jq -r '.id')
 
             if [[ -n "$POLICY_STAGE_ID" && "$POLICY_STAGE_ID" != "null" ]]; then
               echo "Found policy stage: $POLICY_STAGE_ID"
+
+              # Check the stage status and permissions
+              STAGE_STATUS=$(echo "$POLICY_STAGE_DATA" | jq -r '.attributes.status')
+              CAN_OVERRIDE=$(echo "$POLICY_STAGE_DATA" | jq -r '.attributes.permissions."can-override" // false')
+
+              echo "Stage status: $STAGE_STATUS"
+              echo "Can override: $CAN_OVERRIDE"
+
+              # Check if this stage is actually overridable
+              if [[ "$STAGE_STATUS" != "awaiting_override" ]]; then
+                echo "::warning::Task stage is not in 'awaiting_override' status"
+                echo "::warning::Current status: $STAGE_STATUS"
+                echo "::warning::The run may not require override or override was already completed"
+              fi
+
+              if [[ "$CAN_OVERRIDE" != "true" ]]; then
+                echo "::warning::Token does not have permission to override this stage"
+              fi
+
               echo "policy_stage_id=$POLICY_STAGE_ID" >> $GITHUB_OUTPUT
+              echo "stage_status=$STAGE_STATUS" >> $GITHUB_OUTPUT
               echo "using_policy_evaluations=true" >> $GITHUB_OUTPUT
             else
               echo "::error::No policy checks or evaluations found for this run"
