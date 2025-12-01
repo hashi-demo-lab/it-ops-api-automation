@@ -103,6 +103,7 @@ jobs:
 
           # Store detailed policy results for later display
           echo "policy_eval_id=$POLICY_EVAL_ID" >> $GITHUB_OUTPUT
+          echo "policy_stage_id=$POLICY_STAGE_ID" >> $GITHUB_OUTPUT
           echo "policy_count=$TOTAL" >> $GITHUB_OUTPUT
           echo "policies_passed=$PASSED" >> $GITHUB_OUTPUT
           echo "policies_advisory_failed=$ADVISORY_FAILED" >> $GITHUB_OUTPUT
@@ -117,13 +118,45 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Note: Individual policy details are available in TFC UI
-          # The API provides aggregate counts but individual policy names/results
-          # require fetching the full policy output which is large
-          echo ""
-          echo "ℹ️  For detailed policy results (individual policy names and outputs):"
-          echo "   View the full report in TFC: ${{ steps.determine-run.outputs.run_link }}"
-          echo ""
+          # Fetch individual policy results
+          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
+            echo "🔍 Fetching individual policy results..."
+
+            # Get policy set results
+            POLICY_SET_RESULTS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
+
+            # Extract failed mandatory policies
+            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_SET_RESULTS" | jq -r '
+              [.data[] |
+                .relationships.outcomes.data[] as $outcome_ref |
+                (.included[] | select(.id == $outcome_ref.id)) as $outcome |
+                select($outcome.attributes.enforcement_level == "mandatory" and $outcome.attributes.status == "failed") |
+                {
+                  policy: $outcome.attributes."policy-name",
+                  enforcement: $outcome.attributes.enforcement_level,
+                  status: $outcome.attributes.status,
+                  description: (.attributes.description // "No description available")
+                }
+              ] |
+              if length > 0 then
+                map("- **\(.policy)** (\(.enforcement))\n  \(.description)") | join("\n")
+              else
+                "No mandatory policy failures"
+              end
+            ')
+
+            # Save failed policies to output
+            {
+              echo "failed_mandatory_policies<<EOF"
+              echo "$FAILED_MANDATORY_POLICIES"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+
+            echo ""
+            echo "🚫 Failed Mandatory Policies:"
+            echo "$FAILED_MANDATORY_POLICIES"
+            echo ""
+          fi
 
           # Save placeholder for summary (TFC link will be provided)
           echo "policy_details=View detailed policy results in TFC" >> $GITHUB_OUTPUT
@@ -133,199 +166,37 @@ jobs:
         run: |
           if [ "${{ steps.policy-checks.outputs.policies_mandatory_failed }}" != "0" ]; then
             echo "requires_override=true" >> $GITHUB_OUTPUT
-            echo "⚠️  Mandatory policies failed - override required to proceed"
+            echo ""
+            echo "⚠️  MANDATORY POLICIES FAILED - OVERRIDE REQUIRED"
+            echo ""
+            echo "Failed Policies:"
+            echo "${{ steps.policy-checks.outputs.failed_mandatory_policies }}"
+            echo ""
+            echo "Next Steps:"
+            echo "  1. Review the failed policies above"
+            echo "  2. Review detailed policy output in TFC: ${{ steps.determine-run.outputs.run_link }}"
+            echo "  3. If override is justified, run the '2a. Policy Override' workflow"
+            echo "  4. Otherwise, fix the code and create a new plan"
+            echo ""
           else
             echo "requires_override=false" >> $GITHUB_OUTPUT
             echo "✅ All policies passed or only advisory failures"
+            echo "Proceed to Apply workflow (Workflow 3)"
           fi
 
-      - name: Check Workspace Configuration
+      - name: Stop if Override Required
         if: steps.policy-override.outputs.requires_override == 'true'
         run: |
-          WORKSPACE_DATA=$(curl -s \
-            --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
-            --header "Content-Type: application/vnd.api+json" \
-            "https://app.terraform.io/api/v2/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
-
-          AUTO_APPLY=$(echo "$WORKSPACE_DATA" | jq -r '.data.attributes."auto-apply"')
-
-          if [[ "$AUTO_APPLY" == "true" ]]; then
-            echo "::notice::⚡ Workspace has auto-apply enabled"
-            echo "After policy override, TFC will automatically queue the apply."
-          else
-            echo "::notice::✋ Workspace has manual apply (auto-apply: false)"
-            echo "After policy override, run the Apply workflow to complete deployment."
-          fi
-
-      - name: Wait for Policy Override
-        id: wait-for-override
-        if: steps.policy-override.outputs.requires_override == 'true'
-        timeout-minutes: 60
-        run: |
-          # Function: Call TFC API with consistent auth headers
-          tfc_api_call() {
-            local endpoint=$1
-            curl -s \
-              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
-              --header "Content-Type: application/vnd.api+json" \
-              "https://app.terraform.io/api/v2${endpoint}"
-          }
-
-          # Function: Extract override details from comments
-          extract_override_details() {
-            local run_id=$1
-
-            # Fetch override comment from comments API
-            local comments_data=$(tfc_api_call "/runs/$run_id/comments")
-            local override_comment=$(echo "$comments_data" | jq -r '.data[-1].attributes.body // "No comment provided"')
-
-            # Output to GitHub Actions output
-            {
-              echo "override_comment<<EOF"
-              echo "$override_comment"
-              echo "EOF"
-            } >> $GITHUB_OUTPUT
-          }
-
-          # Function: Classify run status into actionable categories
-          classify_run_status() {
-            local status=$1
-
-            case $status in
-              post_plan_awaiting_decision)
-                echo "waiting_override"
-                ;;
-              policy_override|post_plan_completed)
-                echo "override_complete"
-                ;;
-              apply_queued)
-                echo "apply_queued"
-                ;;
-              applying)
-                echo "applying"
-                ;;
-              applied)
-                echo "applied"
-                ;;
-              discarded)
-                echo "discarded"
-                ;;
-              canceled|force_canceled)
-                echo "canceled"
-                ;;
-              errored)
-                echo "errored"
-                ;;
-              *)
-                echo "unknown"
-                ;;
-            esac
-          }
-
-          MAX_WAIT=3600  # 1 hour
-          ELAPSED=0
-          CHECK_INTERVAL=30
-
-          echo "⏳ Waiting for policy override in TFC..."
-          echo "Run ID: ${{ steps.determine-run.outputs.run_id }}"
-          echo "View in TFC: ${{ steps.determine-run.outputs.run_link }}"
-          echo ""
-          echo "Please override the policy in the TFC UI to proceed."
-          echo "This workflow will wait up to 1 hour for the override."
-          echo ""
-
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            RUN_DATA=$(tfc_api_call "/runs/${{ steps.determine-run.outputs.run_id }}")
-            CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
-            STATUS_CLASS=$(classify_run_status "$CURRENT_STATUS")
-
-            echo "[$(date +%H:%M:%S)] Current run status: $CURRENT_STATUS (classified as: $STATUS_CLASS)"
-
-            # Handle different status classifications
-            case $STATUS_CLASS in
-              override_complete|apply_queued)
-                # Override detected - ready for apply
-                echo ""
-                echo "✅ Policy override detected! Run status: $CURRENT_STATUS"
-                echo "Override complete - ready for apply workflow..."
-
-                # Extract override details
-                extract_override_details "${{ steps.determine-run.outputs.run_id }}"
-
-                # Mark as ready for apply
-                echo "override_detected=true" >> $GITHUB_OUTPUT
-                echo "manual_apply_completed=false" >> $GITHUB_OUTPUT
-                exit 0
-                ;;
-
-              applying|applied)
-                # Manual apply detected
-                echo ""
-                echo "⚠️  Apply was manually triggered in TFC UI (status: $CURRENT_STATUS)"
-                echo "For proper workflow control, use the Apply workflow after override."
-
-                # Extract override details
-                extract_override_details "${{ steps.determine-run.outputs.run_id }}"
-
-                # Mark as manually applied
-                echo "override_detected=true" >> $GITHUB_OUTPUT
-                echo "manual_apply_completed=true" >> $GITHUB_OUTPUT
-                exit 0
-                ;;
-
-              discarded)
-                # Run was discarded
-                echo ""
-                echo "🗑️  Run was discarded - user chose not to proceed"
-                echo "No infrastructure changes have been applied."
-                echo ""
-
-                # Mark as discarded
-                echo "run_discarded=true" >> $GITHUB_OUTPUT
-                exit 0
-                ;;
-
-              canceled)
-                # Run was canceled
-                echo ""
-                echo "⛔ Run was canceled manually in TFC"
-                echo "Infrastructure changes will not be applied."
-                echo ""
-
-                # Mark as canceled
-                echo "run_canceled=true" >> $GITHUB_OUTPUT
-                exit 1
-                ;;
-
-              errored)
-                echo "::error::❌ Run entered error state: $CURRENT_STATUS"
-                exit 1
-                ;;
-
-              waiting_override)
-                # Still waiting - continue polling
-                ;;
-
-              *)
-                echo "::warning::⚠️  Unexpected status: $CURRENT_STATUS"
-                ;;
-            esac
-
-            sleep $CHECK_INTERVAL
-            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
-          done
-
-          # Timeout reached
-          echo "::error::⏱️  Timeout: No policy override detected after 1 hour"
-          echo "::error::Run is still waiting for override at: ${{ steps.determine-run.outputs.run_link }}"
+          echo "::error::⛔ Mandatory policy failures detected"
+          echo "::error::"
+          echo "::error::This workflow stops here to allow review of failed policies."
+          echo "::error::"
+          echo "::error::Next steps:"
+          echo "::error::  1. Review failed policies in the summary below"
+          echo "::error::  2. Review detailed output in TFC: ${{ steps.determine-run.outputs.run_link }}"
+          echo "::error::  3. Run '2a. Policy Override' workflow to override if justified"
+          echo "::error::  4. OR fix the code and create a new plan (Workflow 1)"
           exit 1
-
-      - name: Run Discarded
-        if: always() && steps.wait-for-override.outputs.run_discarded == 'true'
-        run: |
-          echo "::notice::🗑️  Run was discarded by user"
-          echo "This is not an error - the run was intentionally discarded."
-          echo "No further action needed."
 
       - name: Generate Summary
         if: always()
@@ -356,45 +227,31 @@ jobs:
             echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
 
-            # Link to detailed policy results
-            if [ "${{ steps.policy-checks.outputs.policies_mandatory_failed }}" != "0" ] || [ "${{ steps.policy-checks.outputs.policies_advisory_failed }}" != "0" ]; then
+            # Show failed mandatory policies
+            if [ "${{ steps.policy-checks.outputs.policies_mandatory_failed }}" != "0" ]; then
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "#### 📋 Policy Failure Details" >> $GITHUB_STEP_SUMMARY
+              echo "#### 🚫 Failed Mandatory Policies" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Failed Policies:**" >> $GITHUB_STEP_SUMMARY
-              echo "- **Mandatory Failures**: ${{ steps.policy-checks.outputs.policies_mandatory_failed }} (blocks deployment)" >> $GITHUB_STEP_SUMMARY
-              echo "- **Advisory Failures**: ${{ steps.policy-checks.outputs.policies_advisory_failed }} (warnings only)" >> $GITHUB_STEP_SUMMARY
+              echo "${{ steps.policy-checks.outputs.failed_mandatory_policies }}" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> 💡 **Action Required**: View the [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }}) to see:" >> $GITHUB_STEP_SUMMARY
-              echo "> - Which specific policies failed" >> $GITHUB_STEP_SUMMARY
-              echo "> - Policy failure reasons and context" >> $GITHUB_STEP_SUMMARY
-              echo "> - Sentinel policy evaluation logs" >> $GITHUB_STEP_SUMMARY
+              echo "> ⚠️ **Override Required**: These mandatory policies are blocking deployment." >> $GITHUB_STEP_SUMMARY
+              echo "> - View [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+              echo "> - Run the **2a. Policy Override** workflow if override is justified" >> $GITHUB_STEP_SUMMARY
+              echo "> - OR fix the code and create a new plan" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> Based on the failures, decide whether to:" >> $GITHUB_STEP_SUMMARY
-              echo "> - **Override** the mandatory policies (if exception is justified)" >> $GITHUB_STEP_SUMMARY
-              echo "> - **Fix** the infrastructure code to comply" >> $GITHUB_STEP_SUMMARY
-              echo "> - **Discard** the run if changes shouldn't be deployed" >> $GITHUB_STEP_SUMMARY
+            elif [ "${{ steps.policy-checks.outputs.policies_advisory_failed }}" != "0" ]; then
               echo "" >> $GITHUB_STEP_SUMMARY
-            fi
-
-            # Override details
-            if [ "${{ steps.wait-for-override.outputs.override_detected }}" == "true" ]; then
+              echo "#### ⚠️ Advisory Policy Warnings" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "#### 🛡️ Policy Override Details" >> $GITHUB_STEP_SUMMARY
+              echo "**Advisory Failures**: ${{ steps.policy-checks.outputs.policies_advisory_failed }} (warnings only, does not block deployment)" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Justification:**" >> $GITHUB_STEP_SUMMARY
+              echo "> View [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> ${{ steps.wait-for-override.outputs.override_comment }}" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> 📝 **Audit Trail**: Policy override decision recorded. All overrides are logged in Terraform Cloud for compliance review." >> $GITHUB_STEP_SUMMARY
-            elif [ "${{ steps.wait-for-override.outputs.run_discarded }}" == "true" ]; then
-              echo "> 🗑️ **Run Discarded**: User chose not to proceed with this deployment." >> $GITHUB_STEP_SUMMARY
-            elif [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
-              echo "> ⚠️ **Action Required**: ${{ steps.policy-checks.outputs.policies_mandatory_failed }} mandatory policies failed. Override required in [TFC UI](${{ steps.determine-run.outputs.run_link }})." >> $GITHUB_STEP_SUMMARY
             else
+              echo "" >> $GITHUB_STEP_SUMMARY
               echo "> ✅ **All Policies Passed**: No overrides required." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
             fi
-            echo "" >> $GITHUB_STEP_SUMMARY
           else
             echo "### ℹ️ No Policies Configured" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -406,21 +263,18 @@ jobs:
           echo "### ⏭️ Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          RUN_DISCARDED="${{ steps.wait-for-override.outputs.run_discarded }}"
-          RUN_CANCELED="${{ steps.wait-for-override.outputs.run_canceled }}"
-          MANUAL_APPLY="${{ steps.wait-for-override.outputs.manual_apply_completed }}"
-          OVERRIDE_DETECTED="${{ steps.wait-for-override.outputs.override_detected }}"
-
-          if [[ "$RUN_DISCARDED" == "true" ]]; then
-            echo "- **Workflow Complete**: Run was discarded, no further action needed" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$RUN_CANCELED" == "true" ]]; then
-            echo "- **Workflow Canceled**: Run was canceled in TFC" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$MANUAL_APPLY" == "true" ]]; then
-            echo "- **Already Applied**: Changes were applied manually in TFC UI" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$OVERRIDE_DETECTED" == "true" ]]; then
-            echo "- **Ready for Apply**: Run the \`3-terraform-apply\` workflow to apply changes" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
+            echo "**Mandatory Policy Override Required:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. Review the failed mandatory policies listed above" >> $GITHUB_STEP_SUMMARY
+            echo "2. Review [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+            echo "3. **Option A**: Run \`2a. Policy Override\` workflow to override (provide justification)" >> $GITHUB_STEP_SUMMARY
+            echo "4. **Option B**: Fix the infrastructure code and run \`1. Terraform Plan\` again" >> $GITHUB_STEP_SUMMARY
+            echo "5. **Option C**: Discard the run in TFC if deployment should not proceed" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- **Waiting**: Override policy in TFC or run will timeout" >> $GITHUB_STEP_SUMMARY
+            echo "**Policies Passed - Ready to Apply:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- Run the \`3. Terraform Apply\` workflow to apply infrastructure changes" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
