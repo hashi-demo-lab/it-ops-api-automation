@@ -156,7 +156,7 @@ jobs:
             --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
             --header "Content-Type: application/vnd.api+json" \
             --request POST \
-            --data '{"comment":"${{ github.event.inputs.justification }}"}' \
+            --data "{\"comment\":\"${{ github.event.inputs.justification }}\"}" \
             "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}/actions/override-policy")
 
           # Extract HTTP status code and body
