@@ -11,7 +11,6 @@ on:
     branches:
       - main
     paths:
-      - '**.tf'
       - '.github/workflows/1-terraform-plan.yml'
 
 env:
