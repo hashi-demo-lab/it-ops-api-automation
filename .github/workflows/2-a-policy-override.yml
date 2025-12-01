@@ -176,10 +176,10 @@ jobs:
             TASK_STAGES=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}/task-stages")
 
             echo "DEBUG: Task stages:"
-            echo "$TASK_STAGES" | jq -c '.data[] | {id: .id, stage: .attributes.stage}'
+            echo "$TASK_STAGES" | jq -c '.data[] | {id: .id, stage: .attributes.stage, status: .attributes.status}'
 
             # Get the post_plan stage which contains policy evaluations
-            POLICY_STAGE_DATA=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan")' | head -n1)
+            POLICY_STAGE_DATA=$(echo "$TASK_STAGES" | jq '.data[] | select(.attributes.stage == "post_plan")')
             POLICY_STAGE_ID=$(echo "$POLICY_STAGE_DATA" | jq -r '.id')
 
             if [[ -n "$POLICY_STAGE_ID" && "$POLICY_STAGE_ID" != "null" ]]; then
