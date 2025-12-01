@@ -12,6 +12,8 @@ on:
       - main
     paths:
       - '.github/workflows/1-terraform-plan.yml'
+      - '**/*.tf'
+      - '**/*.tfvars'
 
 env:
   TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}

@@ -77,19 +77,15 @@ jobs:
           echo "📋 Retrieving failed mandatory policies..."
           echo ""
 
-          # Function: Call TFC API
           tfc_api_call() {
-            local endpoint=$1
             curl -s \
               --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
               --header "Content-Type: application/vnd.api+json" \
-              "https://app.terraform.io/api/v2${endpoint}"
+              "https://app.terraform.io/api/v2$1"
           }
 
           # Get task stages for this run
           TASK_STAGES=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}/task-stages")
-
-          # Get policy stage ID
           POLICY_STAGE_ID=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan") | .id' | head -n1)
 
           if [[ -z "$POLICY_STAGE_ID" || "$POLICY_STAGE_ID" == "null" ]]; then
@@ -100,8 +96,6 @@ jobs:
           # Get policy evaluations
           POLICY_EVALS=$(tfc_api_call "/task-stages/$POLICY_STAGE_ID/policy-evaluations")
           POLICY_EVAL_ID=$(echo "$POLICY_EVALS" | jq -r '.data[0].id')
-
-          # Get mandatory failed count
           MANDATORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count"."mandatory-failed"] | add // 0')
 
           echo "Mandatory policy failures: $MANDATORY_FAILED"
@@ -112,21 +106,15 @@ jobs:
             exit 1
           fi
 
-          # Get individual failed policies from nested outcomes array
+          # Get individual failed policies
           POLICY_SET_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
-
           FAILED_POLICIES=$(echo "$POLICY_SET_OUTCOMES" | jq -r '
             if (.data != null and (.data | length) > 0) then
               [.data[].attributes.outcomes[] |
                 select(.status == "failed") |
                 select(.enforcement_level == "mandatory") |
                 "- \(.policy_name)"
-              ] |
-              if length > 0 then
-                join("\n")
-              else
-                "No specific policy names available"
-              end
+              ] | join("\n") // "No specific policy names available"
             else
               "No specific policy names available"
             end
@@ -147,113 +135,32 @@ jobs:
         id: get-policy-check
         run: |
           echo "🔍 Finding policy check to override..."
+          echo ""
 
-          # Function: Call TFC API
           tfc_api_call() {
-            local endpoint=$1
             curl -s \
               --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
               --header "Content-Type: application/vnd.api+json" \
-              "https://app.terraform.io/api/v2${endpoint}"
+              "https://app.terraform.io/api/v2$1"
           }
 
-          # Get run details to find policy check
           RUN_DATA=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}")
-
-          # Debug: Show what relationships exist
-          echo "DEBUG: Available relationships:"
-          echo "$RUN_DATA" | jq -c '.data.relationships | keys'
-          echo ""
-
-          # Debug: Show the policy-checks relationship
-          echo "DEBUG: policy-checks relationship:"
-          echo "$RUN_DATA" | jq -c '.data.relationships."policy-checks"'
-          echo ""
-
-          # Try policy-checks first (legacy)
           POLICY_CHECK_ID=$(echo "$RUN_DATA" | jq -r '.data.relationships."policy-checks".data[0].id // empty')
 
-          # If no policy-checks, try task-stages (newer policy evaluations)
           if [[ -z "$POLICY_CHECK_ID" || "$POLICY_CHECK_ID" == "null" ]]; then
-            echo "No legacy policy-checks found, checking task-stages..."
-
-            # Get task stages
             TASK_STAGES=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}/task-stages")
-
-            echo "DEBUG: Task stages:"
-            echo "$TASK_STAGES" | jq -c '.data[] | {id: .id, stage: .attributes.stage, status: .attributes.status}'
-            echo ""
-
-            # Get the post_plan stage which contains policy evaluations
-            POLICY_STAGE_DATA=$(echo "$TASK_STAGES" | jq '.data[] | select(.attributes.stage == "post_plan")')
-            POLICY_STAGE_ID=$(echo "$POLICY_STAGE_DATA" | jq -r '.id')
+            POLICY_STAGE_ID=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan") | .id')
 
             if [[ -n "$POLICY_STAGE_ID" && "$POLICY_STAGE_ID" != "null" ]]; then
               echo "Found policy stage: $POLICY_STAGE_ID"
-              echo ""
-
-              # Show full task stage data for debugging
-              echo "DEBUG: Full post_plan task stage data:"
-              echo "$POLICY_STAGE_DATA" | jq '.'
-              echo ""
-
-              # Check the stage status and permissions
-              STAGE_STATUS=$(echo "$POLICY_STAGE_DATA" | jq -r '.attributes.status')
-              CAN_OVERRIDE=$(echo "$POLICY_STAGE_DATA" | jq -r '.attributes.permissions."can-override" // false')
-
-              echo "📊 Task Stage Status: $STAGE_STATUS"
-              echo "🔐 Can Override: $CAN_OVERRIDE"
-              echo ""
-
-              # Check if this stage is actually overridable
-              if [[ "$STAGE_STATUS" != "awaiting_override" ]]; then
-                echo "::error::❌ Task stage is not in 'awaiting_override' status"
-                echo "::error::"
-                echo "::error::Current status: $STAGE_STATUS"
-                echo "::error::"
-                echo "::error::This stage cannot be overridden because:"
-
-                case $STAGE_STATUS in
-                  passed)
-                    echo "::error::  - The policies have already passed"
-                    echo "::error::  - No override is needed"
-                    ;;
-                  failed)
-                    echo "::error::  - This is a HARD-MANDATORY policy failure"
-                    echo "::error::  - Hard-mandatory policies cannot be overridden via API"
-                    echo "::error::  - You must fix the code to satisfy the policy"
-                    ;;
-                  errored)
-                    echo "::error::  - The policy evaluation encountered an error"
-                    echo "::error::  - Check the policy code or evaluation logs"
-                    ;;
-                  *)
-                    echo "::error::  - Unknown status: $STAGE_STATUS"
-                    ;;
-                esac
-
-                echo "::error::"
-                echo "::error::Expected status: awaiting_override (for soft-mandatory failures)"
-                exit 1
-              fi
-
-              if [[ "$CAN_OVERRIDE" != "true" ]]; then
-                echo "::error::❌ Token does not have permission to override this stage"
-                echo "::error::"
-                echo "::error::The TF_API_TOKEN secret does not have 'can-override' permission."
-                echo "::error::Verify the token has appropriate permissions in TFC."
-                exit 1
-              fi
-
               echo "policy_stage_id=$POLICY_STAGE_ID" >> $GITHUB_OUTPUT
-              echo "stage_status=$STAGE_STATUS" >> $GITHUB_OUTPUT
               echo "using_policy_evaluations=true" >> $GITHUB_OUTPUT
             else
               echo "::error::No policy checks or evaluations found for this run"
               exit 1
             fi
           else
-            echo "Policy Check ID: $POLICY_CHECK_ID"
+            echo "Found policy check: $POLICY_CHECK_ID"
             echo "policy_check_id=$POLICY_CHECK_ID" >> $GITHUB_OUTPUT
             echo "using_policy_evaluations=false" >> $GITHUB_OUTPUT
           fi
@@ -261,57 +168,42 @@ jobs:
       - name: Apply Override
         id: override
         run: |
-          echo "🛡️ Applying policy override via API..."
+          echo "🛡️ Applying policy override..."
           echo ""
           echo "Justification: ${{ github.event.inputs.justification }}"
           echo ""
 
           # Determine which override endpoint to use
           if [[ "${{ steps.get-policy-check.outputs.using_policy_evaluations }}" == "true" ]]; then
-            # Use task-stage override (newer policy evaluations)
-            echo "Using task-stage override endpoint..."
             OVERRIDE_URL="https://app.terraform.io/api/v2/task-stages/${{ steps.get-policy-check.outputs.policy_stage_id }}/actions/override"
           else
-            # Use policy-check override (legacy)
-            echo "Using policy-check override endpoint..."
             OVERRIDE_URL="https://app.terraform.io/api/v2/policy-checks/${{ steps.get-policy-check.outputs.policy_check_id }}/actions/override"
           fi
 
-          echo "Override URL: $OVERRIDE_URL"
-
           # Apply override
-          OVERRIDE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /dev/null \
             --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
             --header "Content-Type: application/vnd.api+json" \
             --request POST \
             "$OVERRIDE_URL")
 
-          # Extract HTTP status code and body
-          HTTP_CODE=$(echo "$OVERRIDE_RESPONSE" | tail -n1)
-          RESPONSE_BODY=$(echo "$OVERRIDE_RESPONSE" | sed '$d')
-
-          echo "Response status: $HTTP_CODE"
-
           if [[ "$HTTP_CODE" =~ ^2 ]]; then
             echo "✅ Policy override applied successfully"
             echo "override_complete=true" >> $GITHUB_OUTPUT
 
-            # Now add the justification comment to the run
-            echo ""
+            # Add justification comment to the run
             echo "📝 Adding justification comment..."
 
-            COMMENT_RESPONSE=$(curl -s \
+            curl -s \
               --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
               --header "Content-Type: application/vnd.api+json" \
               --request POST \
               --data "{\"data\":{\"type\":\"comments\",\"attributes\":{\"body\":\"Policy Override Justification: ${{ github.event.inputs.justification }}\"}}}" \
-              "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}/comments")
+              "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}/comments" > /dev/null
 
             echo "✅ Justification comment added"
           else
-            echo "::error::❌ Failed to apply override"
-            echo "::error::HTTP Status: $HTTP_CODE"
-            echo "::error::Response: $RESPONSE_BODY"
+            echo "::error::❌ Failed to apply override (HTTP $HTTP_CODE)"
             exit 1
           fi
 
