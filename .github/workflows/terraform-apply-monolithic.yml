@@ -10,7 +10,6 @@ on:
       - main
     paths:
       # Only trigger when Terraform files change
-      - '**.tf'
       - '**.tfvars'
       - '.github/workflows/terraform-apply.yml'
 
