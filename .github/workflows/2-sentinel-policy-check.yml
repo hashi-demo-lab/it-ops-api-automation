@@ -119,29 +119,27 @@ jobs:
           echo ""
 
           # Fetch individual policy results
-          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
+          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" && "$MANDATORY_FAILED" -gt 0 ]]; then
             echo "🔍 Fetching individual policy results..."
 
             # Get policy set results
             POLICY_SET_RESULTS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
 
-            # Extract failed mandatory policies
+            # Extract failed mandatory policies with safer parsing
             FAILED_MANDATORY_POLICIES=$(echo "$POLICY_SET_RESULTS" | jq -r '
-              [.data[] |
-                .relationships.outcomes.data[] as $outcome_ref |
-                (.included[] | select(.id == $outcome_ref.id)) as $outcome |
-                select($outcome.attributes.enforcement_level == "mandatory" and $outcome.attributes.status == "failed") |
-                {
-                  policy: $outcome.attributes."policy-name",
-                  enforcement: $outcome.attributes.enforcement_level,
-                  status: $outcome.attributes.status,
-                  description: (.attributes.description // "No description available")
-                }
-              ] |
-              if length > 0 then
-                map("- **\(.policy)** (\(.enforcement))\n  \(.description)") | join("\n")
+              if .included then
+                [.included[] |
+                  select(.type == "policy-outcomes") |
+                  select(.attributes."enforcement-level" == "mandatory" and .attributes.status == "failed") |
+                  "- **\(.attributes."policy-name")** (mandatory)"
+                ] |
+                if length > 0 then
+                  join("\n")
+                else
+                  "No specific policy details available - view in TFC"
+                end
               else
-                "No mandatory policy failures"
+                "No specific policy details available - view in TFC"
               end
             ')
 
@@ -156,6 +154,13 @@ jobs:
             echo "🚫 Failed Mandatory Policies:"
             echo "$FAILED_MANDATORY_POLICIES"
             echo ""
+          else
+            # No policy details to fetch
+            {
+              echo "failed_mandatory_policies<<EOF"
+              echo "View detailed policy failures in TFC"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
           fi
 
           # Save placeholder for summary (TFC link will be provided)
