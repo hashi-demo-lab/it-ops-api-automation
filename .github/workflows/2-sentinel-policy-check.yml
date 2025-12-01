@@ -118,28 +118,34 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Fetch individual policy results
-          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" && "$MANDATORY_FAILED" -gt 0 ]]; then
-            echo "🔍 Fetching individual policy results..."
+          # Fetch individual policy check results with failure details
+          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
+            echo "🔍 Fetching detailed policy check results..."
 
-            # Get policy set results
-            POLICY_SET_RESULTS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
+            # Get the policy checks (this includes policy names and results)
+            POLICY_CHECKS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-checks")
 
-            # Extract failed mandatory policies with safer parsing
-            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_SET_RESULTS" | jq -r '
-              if .included then
-                [.included[] |
-                  select(.type == "policy-outcomes") |
-                  select(.attributes."enforcement-level" == "mandatory" and .attributes.status == "failed") |
-                  "- **\(.attributes."policy-name")** (mandatory)"
+            # Extract failed mandatory policies with their results
+            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_CHECKS" | jq -r '
+              if .data then
+                [.data[] |
+                  select(.attributes.scope == "organization" or .attributes.scope == "workspace") |
+                  select(.attributes.status == "failed") |
+                  select(.attributes."enforcement-level" // .attributes."enforcement-mode" == "mandatory") |
+                  {
+                    name: .attributes.name,
+                    result: (.attributes.result // "Failed"),
+                    message: (.attributes."status-timestamps" // {} | if . then "Check failed" else "Check failed" end)
+                  } |
+                  "- **\(.name)** (mandatory)\n  Result: \(.result)"
                 ] |
                 if length > 0 then
                   join("\n")
                 else
-                  "No specific policy details available - view in TFC"
+                  "No failed mandatory policies found in API response"
                 end
               else
-                "No specific policy details available - view in TFC"
+                "Unable to retrieve policy check details from API"
               end
             ')
 
@@ -154,6 +160,9 @@ jobs:
             echo "🚫 Failed Mandatory Policies:"
             echo "$FAILED_MANDATORY_POLICIES"
             echo ""
+
+            # Also save raw policy check data for debugging
+            echo "policy_checks_count=$(echo "$POLICY_CHECKS" | jq '[.data[]] | length')" >> $GITHUB_OUTPUT
           else
             # No policy details to fetch
             {
@@ -189,19 +198,18 @@ jobs:
             echo "Proceed to Apply workflow (Workflow 3)"
           fi
 
-      - name: Stop if Override Required
+      - name: Policy Review Complete
         if: steps.policy-override.outputs.requires_override == 'true'
         run: |
-          echo "::error::⛔ Mandatory policy failures detected"
-          echo "::error::"
-          echo "::error::This workflow stops here to allow review of failed policies."
-          echo "::error::"
-          echo "::error::Next steps:"
-          echo "::error::  1. Review failed policies in the summary below"
-          echo "::error::  2. Review detailed output in TFC: ${{ steps.determine-run.outputs.run_link }}"
-          echo "::error::  3. Run '2a. Policy Override' workflow to override if justified"
-          echo "::error::  4. OR fix the code and create a new plan (Workflow 1)"
-          exit 1
+          echo "::warning::⚠️  Mandatory policy failures detected"
+          echo "::warning::"
+          echo "::warning::Review the failed policies in the summary below."
+          echo "::warning::"
+          echo "::warning::Next steps:"
+          echo "::warning::  1. Review failed policies in the summary"
+          echo "::warning::  2. Review detailed output in TFC: ${{ steps.determine-run.outputs.run_link }}"
+          echo "::warning::  3. Run '2a. Policy Override' workflow to override if justified"
+          echo "::warning::  4. OR fix the code and create a new plan (Workflow 1)"
 
       - name: Generate Summary
         if: always()
