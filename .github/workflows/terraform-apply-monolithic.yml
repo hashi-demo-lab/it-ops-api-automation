@@ -21,7 +21,7 @@ on:
 env:
   # These reference GitHub secrets/variables you configured in Task 2
   TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
-  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN_MONOLITHIC_RUN }}
   TF_WORKSPACE: "it-ops-api-automation"
   # Set log level for debugging (OFF, ERROR, INFO, DEBUG)
   TF_LOG: "INFO"
