@@ -120,43 +120,27 @@ jobs:
 
           # Fetch individual policy outcomes with failure details
           if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
-            echo "🔍 Fetching detailed policy outcomes..."
+            echo "🔍 Fetching detailed policy set outcomes..."
             echo "Policy Eval ID: $POLICY_EVAL_ID"
 
-            # Get the policy outcomes (individual policy results)
-            POLICY_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-outcomes")
+            # Get policy set outcomes - individual policies are nested in .data[].attributes.outcomes[]
+            POLICY_SET_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
 
-            # Debug: Show the raw response
-            echo ""
-            echo "DEBUG: Raw API Response:"
-            echo "$POLICY_OUTCOMES" | jq -c '.'
-            echo ""
-            echo "DEBUG: Response structure:"
-            echo "$POLICY_OUTCOMES" | jq -c '{
-              has_data: (.data != null),
-              data_type: (.data | type),
-              data_length: (.data | length // 0),
-              has_errors: (.errors != null),
-              first_item_type: (.data[0].type // "none"),
-              first_item_attrs: (.data[0].attributes // null)
-            }'
-            echo ""
-
-            # Extract failed mandatory policies with their results
-            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_OUTCOMES" | jq -r '
+            # Extract failed mandatory policies from the nested outcomes array
+            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_SET_OUTCOMES" | jq -r '
               if (.data != null and (.data | length) > 0) then
-                [.data[] |
-                  select(.attributes.status == "failed") |
-                  select(.attributes."enforcement-level" == "mandatory") |
-                  "- **\(.attributes."policy-name")** (mandatory)"
+                [.data[].attributes.outcomes[] |
+                  select(.status == "failed") |
+                  select(.enforcement_level == "mandatory") |
+                  "- **\(.policy_name)** (mandatory)"
                 ] |
                 if length > 0 then
                   join("\n")
                 else
-                  "Mandatory policies failed but no details available in API - view in TFC"
+                  "Mandatory policies failed but no details found in API response"
                 end
               else
-                "API returned no policy outcome data - view details in TFC"
+                "No policy outcome data available from API - view in TFC for details"
               end
             ')
 
