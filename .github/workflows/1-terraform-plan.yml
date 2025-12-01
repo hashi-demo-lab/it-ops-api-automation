@@ -82,6 +82,7 @@ jobs:
 
       - name: Create Run
         id: create-run
+        continue-on-error: true
         uses: hashicorp/tfc-workflows-github/actions/create-run@v1.3.2
         with:
           workspace: ${{ env.TF_WORKSPACE }}
