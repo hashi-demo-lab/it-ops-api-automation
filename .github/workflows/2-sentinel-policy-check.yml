@@ -118,33 +118,28 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Fetch individual policy check results with failure details
+          # Fetch individual policy outcomes with failure details
           if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
-            echo "🔍 Fetching detailed policy check results..."
+            echo "🔍 Fetching detailed policy outcomes..."
 
-            # Get the policy checks (this includes policy names and results)
-            POLICY_CHECKS=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-checks")
+            # Get the policy outcomes (individual policy results)
+            POLICY_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-outcomes")
 
-            # Debug: Show what we got back
-            echo "DEBUG: Policy checks response structure:"
-            echo "$POLICY_CHECKS" | jq -c '{data_exists: (.data != null), data_length: (.data | length // 0), first_item: (.data[0] // null)}'
-            echo ""
-
-            # Extract failed mandatory policies with their results (safer parsing)
-            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_CHECKS" | jq -r '
+            # Extract failed mandatory policies with their results
+            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_OUTCOMES" | jq -r '
               if (.data != null and (.data | length) > 0) then
                 [.data[] |
                   select(.attributes.status == "failed") |
-                  select((.attributes."enforcement-level" // .attributes."enforcement-mode") == "mandatory") |
-                  "- **\(.attributes.name)** (\(.attributes."enforcement-level" // .attributes."enforcement-mode"))"
+                  select(.attributes."enforcement-level" == "mandatory") |
+                  "- **\(.attributes."policy-name")** (mandatory)"
                 ] |
                 if length > 0 then
                   join("\n")
                 else
-                  "Mandatory policies failed but no details available - view in TFC"
+                  "Mandatory policies failed but no details available in API - view in TFC"
                 end
               else
-                "API returned no policy check data - view details in TFC"
+                "API returned no policy outcome data - view details in TFC"
               end
             ')
 
