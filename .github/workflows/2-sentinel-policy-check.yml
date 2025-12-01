@@ -117,33 +117,16 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Get detailed policy outcomes if available
-          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
-            echo "📋 Fetching detailed policy results..."
+          # Note: Individual policy details are available in TFC UI
+          # The API provides aggregate counts but individual policy names/results
+          # require fetching the full policy output which is large
+          echo ""
+          echo "ℹ️  For detailed policy results (individual policy names and outputs):"
+          echo "   View the full report in TFC: ${{ steps.determine-run.outputs.run_link }}"
+          echo ""
 
-            # The policy evaluation includes relationships to policy-set-outcomes
-            # We'll extract and display individual policy results
-            POLICY_OUTCOMES=$(echo "$POLICY_EVALS" | jq -r '
-              .data[0].attributes.outcomes[] // [] |
-              "  • \(.["policy-name"] // "Unknown Policy"): \(.status // "unknown") (enforcement: \(.["enforcement-level"] // "unknown"))"
-            ')
-
-            if [[ -n "$POLICY_OUTCOMES" ]]; then
-              echo ""
-              echo "Individual Policy Results:"
-              echo "$POLICY_OUTCOMES"
-            fi
-          fi
-
-          # Save the full policy evaluation data for summary
-          {
-            echo "policy_details<<EOF"
-            echo "$POLICY_EVALS" | jq -r '
-              .data[0].attributes.outcomes[]? // [] |
-              "**\(.["policy-name"] // "Unknown")**: \(.status) (Enforcement: \(.["enforcement-level"] // "unknown"))"
-            '
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+          # Save placeholder for summary (TFC link will be provided)
+          echo "policy_details=View detailed policy results in TFC" >> $GITHUB_OUTPUT
 
       - name: Check if Override Required
         id: policy-override
@@ -373,18 +356,24 @@ jobs:
             echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
 
-            # Show individual policy results if available
-            POLICY_DETAILS="${{ steps.policy-checks.outputs.policy_details }}"
-            if [[ -n "$POLICY_DETAILS" && "$POLICY_DETAILS" != "" ]]; then
-              echo "#### 📋 Individual Policy Results" >> $GITHUB_STEP_SUMMARY
+            # Link to detailed policy results
+            if [ "${{ steps.policy-checks.outputs.policies_mandatory_failed }}" != "0" ] || [ "${{ steps.policy-checks.outputs.policies_advisory_failed }}" != "0" ]; then
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "$POLICY_DETAILS" | while IFS= read -r line; do
-                if [[ -n "$line" ]]; then
-                  echo "- $line" >> $GITHUB_STEP_SUMMARY
-                fi
-              done
+              echo "#### 📋 Policy Failure Details" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> 💡 **Tip**: Review failed mandatory policies to determine if override is appropriate" >> $GITHUB_STEP_SUMMARY
+              echo "**Failed Policies:**" >> $GITHUB_STEP_SUMMARY
+              echo "- **Mandatory Failures**: ${{ steps.policy-checks.outputs.policies_mandatory_failed }} (blocks deployment)" >> $GITHUB_STEP_SUMMARY
+              echo "- **Advisory Failures**: ${{ steps.policy-checks.outputs.policies_advisory_failed }} (warnings only)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> 💡 **Action Required**: View the [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }}) to see:" >> $GITHUB_STEP_SUMMARY
+              echo "> - Which specific policies failed" >> $GITHUB_STEP_SUMMARY
+              echo "> - Policy failure reasons and context" >> $GITHUB_STEP_SUMMARY
+              echo "> - Sentinel policy evaluation logs" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "> Based on the failures, decide whether to:" >> $GITHUB_STEP_SUMMARY
+              echo "> - **Override** the mandatory policies (if exception is justified)" >> $GITHUB_STEP_SUMMARY
+              echo "> - **Fix** the infrastructure code to comply" >> $GITHUB_STEP_SUMMARY
+              echo "> - **Discard** the run if changes shouldn't be deployed" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
             fi
 
