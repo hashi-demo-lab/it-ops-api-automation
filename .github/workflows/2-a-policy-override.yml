@@ -143,21 +143,49 @@ jobs:
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
+      - name: Get Policy Check ID
+        id: get-policy-check
+        run: |
+          echo "🔍 Finding policy check to override..."
+
+          # Function: Call TFC API
+          tfc_api_call() {
+            local endpoint=$1
+            curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2${endpoint}"
+          }
+
+          # Get run details to find policy check
+          RUN_DATA=$(tfc_api_call "/runs/${{ github.event.inputs.run_id }}")
+
+          # Get the policy check ID from the run relationships
+          POLICY_CHECK_ID=$(echo "$RUN_DATA" | jq -r '.data.relationships."policy-checks".data[0].id // empty')
+
+          if [[ -z "$POLICY_CHECK_ID" || "$POLICY_CHECK_ID" == "null" ]]; then
+            echo "::error::No policy check found for this run"
+            echo "::error::This run may not have policy checks configured"
+            exit 1
+          fi
+
+          echo "Policy Check ID: $POLICY_CHECK_ID"
+          echo "policy_check_id=$POLICY_CHECK_ID" >> $GITHUB_OUTPUT
+
       - name: Apply Override
         id: override
         run: |
-          echo "🛡️ Applying policy override..."
+          echo "🛡️ Applying policy override via API..."
           echo ""
           echo "Justification: ${{ github.event.inputs.justification }}"
           echo ""
 
-          # Apply override via API
+          # Apply override to the policy check
           OVERRIDE_RESPONSE=$(curl -s -w "\n%{http_code}" \
             --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
             --header "Content-Type: application/vnd.api+json" \
             --request POST \
-            --data "{\"comment\":\"${{ github.event.inputs.justification }}\"}" \
-            "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}/actions/override-policy")
+            "https://app.terraform.io/api/v2/policy-checks/${{ steps.get-policy-check.outputs.policy_check_id }}/actions/override")
 
           # Extract HTTP status code and body
           HTTP_CODE=$(echo "$OVERRIDE_RESPONSE" | tail -n1)
@@ -168,6 +196,19 @@ jobs:
           if [[ "$HTTP_CODE" =~ ^2 ]]; then
             echo "✅ Policy override applied successfully"
             echo "override_complete=true" >> $GITHUB_OUTPUT
+
+            # Now add the justification comment to the run
+            echo ""
+            echo "📝 Adding justification comment..."
+
+            COMMENT_RESPONSE=$(curl -s \
+              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              --request POST \
+              --data "{\"data\":{\"type\":\"comments\",\"attributes\":{\"body\":\"Policy Override Justification: ${{ github.event.inputs.justification }}\"}}}" \
+              "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}/comments")
+
+            echo "✅ Justification comment added"
           else
             echo "::error::❌ Failed to apply override"
             echo "::error::HTTP Status: $HTTP_CODE"
