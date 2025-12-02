@@ -21,7 +21,7 @@ config:
   look: handDrawn
   theme: forest
 ---
-graph TB
+graph LR
     Dev["👨‍💻 Developer"]
     Approver["👮 Approver"]
     
