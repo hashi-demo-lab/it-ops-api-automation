@@ -30,7 +30,7 @@ variable "bu_projects" {
 # output "pet_name" {
 #   description = "The generated random pet name"
 #   value       = random_pet.example_pet.id
-}
+#}
 
 # resource "random_id" "example_id" {
 #   byte_length = 4
