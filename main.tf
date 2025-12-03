@@ -21,16 +21,16 @@ variable "bu_projects" {
   default = ""
 }
 
-# # A simple random pet resource to test deployments
-# resource "random_pet" "example_pet" {
-#   length    = 3
-#   separator = "-"
-# }
+# A simple random pet resource to test deployments
+resource "random_pet" "example_pet" {
+  length    = 3
+  separator = "-"
+}
 
-# output "pet_name" {
-#   description = "The generated random pet name"
-#   value       = random_pet.example_pet.id
-#}
+output "pet_name" {
+  description = "The generated random pet name"
+  value       = random_pet.example_pet.id
+}
 
 # resource "random_id" "example_id" {
 #   byte_length = 4
