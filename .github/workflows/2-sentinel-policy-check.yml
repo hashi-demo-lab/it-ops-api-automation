@@ -85,14 +85,13 @@ jobs:
             exit 0
           fi
 
-          # Parse JSON output from tfci
+          # Parse basic counts from tfci output
           TOTAL=$(jq -r '.total_count // 0' policy_output.json)
           PASSED=$(jq -r '.passed_count // 0' policy_output.json)
           ADVISORY_FAILED=$(jq -r '.advisory_failed_count // 0' policy_output.json)
           MANDATORY_FAILED=$(jq -r '.mandatory_failed_count // 0' policy_output.json)
           ERRORED=$(jq -r '.errored_count // 0' policy_output.json)
           REQUIRES_OVERRIDE=$(jq -r '.requires_override // false' policy_output.json)
-          POLICY_STATUS=$(jq -r '.policy_status // "unknown"' policy_output.json)
 
           if [ "$TOTAL" -eq 0 ]; then
             echo "policies_enabled=false" >> $GITHUB_OUTPUT
@@ -101,14 +100,16 @@ jobs:
           fi
 
           echo "policies_enabled=true" >> $GITHUB_OUTPUT
-
-          # Store policy results
           echo "policy_count=$TOTAL" >> $GITHUB_OUTPUT
           echo "policies_passed=$PASSED" >> $GITHUB_OUTPUT
           echo "policies_advisory_failed=$ADVISORY_FAILED" >> $GITHUB_OUTPUT
           echo "policies_mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
           echo "policies_errored=$ERRORED" >> $GITHUB_OUTPUT
-          echo "policy_status=$POLICY_STATUS" >> $GITHUB_OUTPUT
+          echo "requires_override=$REQUIRES_OVERRIDE" >> $GITHUB_OUTPUT
+
+          # Store the complete policy_details as output
+          POLICY_DETAILS=$(jq -c '.policy_details // {}' policy_output.json)
+          echo "policy_details=$POLICY_DETAILS" >> $GITHUB_OUTPUT
 
           echo "📊 Policy Evaluation Summary:"
           echo "   Total Policies: $TOTAL"
@@ -117,61 +118,6 @@ jobs:
           echo "   🚫 Failed (Mandatory): $MANDATORY_FAILED"
           echo "   ❌ Errored: $ERRORED"
           echo ""
-
-          # Extract failed policies with descriptions from policy_details (raw API response)
-          # This contains the complete TFC API response with all policy information
-          FAILED_MANDATORY_POLICIES=$(jq -r '
-            if .policy_details then
-              .policy_details |
-              if .data and .data.attributes and .data.attributes."policy-set-outcomes" then
-                .data.attributes."policy-set-outcomes" |
-                map(
-                  select(.outcomes."mandatory-failed" > 0) |
-                  if .description != "" and .description != null then
-                    "- \(.description) (\(.outcomes."mandatory-failed") failed)"
-                  elif ."policy-set-name" != "" and ."policy-set-name" != null then
-                    "- \(."policy-set-name") (\(.outcomes."mandatory-failed") mandatory policy failures)"
-                  else
-                    "- Policy set with \(.outcomes."mandatory-failed") mandatory failures"
-                  end
-                ) | join("\n")
-              else
-                "View detailed policy failures in TFC"
-              end
-            elif .failed_policies then
-              # Fallback to failed_policies if policy_details not available
-              .failed_policies | 
-              if length > 0 then
-                map(
-                  if .description != "" and .description != null then
-                    "- \(.description)"
-                  elif .policy_name != "" and .policy_name != null then
-                    "- \(.policy_name) (\(.enforcement_level))"
-                  else
-                    "- Policy failed (\(.enforcement_level))"
-                  end
-                ) | join("\n")
-              else
-                "View detailed policy failures in TFC"
-              end
-            else
-              "View detailed policy failures in TFC"
-            end
-          ' policy_output.json)
-
-          # Save failed policies to output
-          {
-            echo "failed_mandatory_policies<<EOF"
-            echo "$FAILED_MANDATORY_POLICIES"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
-
-          if [ "$MANDATORY_FAILED" -gt 0 ]; then
-            echo ""
-            echo "🚫 Failed Mandatory Policies:"
-            echo "$FAILED_MANDATORY_POLICIES"
-            echo ""
-          fi
 
           # Clean up
           rm -f policy_output.json
@@ -184,14 +130,10 @@ jobs:
             echo ""
             echo "⚠️  MANDATORY POLICIES FAILED - OVERRIDE REQUIRED"
             echo ""
-            echo "Failed Policies:"
-            echo "${{ steps.policy-checks.outputs.failed_mandatory_policies }}"
-            echo ""
             echo "Next Steps:"
-            echo "  1. Review the failed policies above"
-            echo "  2. Review detailed policy output in TFC: ${{ steps.determine-run.outputs.run_link }}"
-            echo "  3. If override is justified, run the '2a. Policy Override' workflow"
-            echo "  4. Otherwise, fix the code and create a new plan"
+            echo "  1. Review detailed policy output in TFC: ${{ steps.determine-run.outputs.run_link }}"
+            echo "  2. If override is justified, run the '2a. Policy Override' workflow"
+            echo "  3. Otherwise, fix the code and create a new plan"
             echo ""
           else
             echo "requires_override=false" >> $GITHUB_OUTPUT
@@ -204,101 +146,7 @@ jobs:
         run: |
           echo "::warning::⚠️  Mandatory policy failures detected"
           echo "::warning::"
-          echo "::warning::Review the failed policies in the summary below."
-          echo "::warning::"
           echo "::warning::Next steps:"
-          echo "::warning::  1. Review failed policies in the summary"
-          echo "::warning::  2. Review detailed output in TFC: ${{ steps.determine-run.outputs.run_link }}"
-          echo "::warning::  3. Run '2a. Policy Override' workflow to override if justified"
-          echo "::warning::  4. OR fix the code and create a new plan (Workflow 1)"
-
-      - name: Generate Summary
-        if: always()
-        run: |
-          echo "# 🛡️ Sentinel Policy Check Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Status section
-          echo "### 🎯 Policy Check Status" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Attribute | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Workflow** | 2. Sentinel Policy Check |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Run ID** | \`${{ steps.determine-run.outputs.run_id }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Policy evaluation results
-          if [ "${{ steps.policy-checks.outputs.policies_enabled }}" == "true" ]; then
-            echo "### 🛡️ Sentinel Policy Evaluations" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Result Type | Count |" >> $GITHUB_STEP_SUMMARY
-            echo "|-------------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| ✅ **Passed** | ${{ steps.policy-checks.outputs.policies_passed }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| ⚠️ **Failed (Advisory)** | ${{ steps.policy-checks.outputs.policies_advisory_failed }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🚫 **Failed (Mandatory)** | ${{ steps.policy-checks.outputs.policies_mandatory_failed }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| ❌ **Errored** | ${{ steps.policy-checks.outputs.policies_errored }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| 📋 **Total Evaluations** | ${{ steps.policy-checks.outputs.policy_count }} |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-
-            # Show failed mandatory policies
-            if [ "${{ steps.policy-checks.outputs.policies_mandatory_failed }}" != "0" ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "#### 🚫 Failed Mandatory Policies" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "${{ steps.policy-checks.outputs.failed_mandatory_policies }}" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> ⚠️ **Override Required**: These mandatory policies are blocking deployment." >> $GITHUB_STEP_SUMMARY
-              echo "> - View [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
-              echo "> - Run the **2a. Policy Override** workflow if override is justified" >> $GITHUB_STEP_SUMMARY
-              echo "> - OR fix the code and create a new plan" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-            elif [ "${{ steps.policy-checks.outputs.policies_advisory_failed }}" != "0" ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "#### ⚠️ Advisory Policy Warnings" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Advisory Failures**: ${{ steps.policy-checks.outputs.policies_advisory_failed }} (warnings only, does not block deployment)" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> View [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> ✅ **All Policies Passed**: No overrides required." >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "### ℹ️ No Policies Configured" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "No Sentinel policies are configured for this workspace." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Next steps
-          echo "### ⏭️ Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ "${{ steps.policy-override.outputs.requires_override }}" == "true" ]; then
-            echo "**Mandatory Policy Override Required:**" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "1. Review the failed mandatory policies listed above" >> $GITHUB_STEP_SUMMARY
-            echo "2. Review [detailed policy output in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
-            echo "3. **Option A**: Run \`2a. Policy Override\` workflow to override (provide justification)" >> $GITHUB_STEP_SUMMARY
-            echo "4. **Option B**: Fix the infrastructure code and run \`1. Terraform Plan\` again" >> $GITHUB_STEP_SUMMARY
-            echo "5. **Option C**: Discard the run in TFC if deployment should not proceed" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**Policies Passed - Ready to Apply:**" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "- Run the \`3. Terraform Apply\` workflow to apply infrastructure changes" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Links
-          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- [View Run in TFC](${{ steps.determine-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
-          echo "- [Workspace: ${{ env.TF_WORKSPACE }}](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Metadata
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "*Generated by GitHub Actions | Workflow: Sentinel Policy Check*" >> $GITHUB_STEP_SUMMARY
+          echo "::warning::  1. Review detailed output in TFC: ${{ steps.determine-run.outputs.run_link }}"
+          echo "::warning::  2. Run '2a. Policy Override' workflow to override if justified"
+          echo "::warning::  3. OR fix the code and create a new plan (Workflow 1)"
