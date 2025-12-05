@@ -77,38 +77,24 @@ jobs:
 
           echo "# 🛡️ Sentinel Policy Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Run ID:** \`${{ steps.determine-run.outputs.run_id }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Workspace:** \`${{ env.TF_WORKSPACE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ steps.policy-check.outputs.total }}" -eq 0 ]; then
-            echo "## ℹ️ No Policies Configured" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Next Step:** Run **3. Terraform Apply** workflow" >> $GITHUB_STEP_SUMMARY
+            echo "No policies configured" >> $GITHUB_STEP_SUMMARY
           else
-            echo "## Policy Results" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
             echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
             echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
             echo "| ✅ Passed | ${{ steps.policy-check.outputs.passed }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| ⚠️ Advisory Failed | ${{ steps.policy-check.outputs.advisory_failed }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🚫 Mandatory Failed | ${{ steps.policy-check.outputs.mandatory_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚠️ Advisory | ${{ steps.policy-check.outputs.advisory_failed }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🚫 Mandatory | ${{ steps.policy-check.outputs.mandatory_failed }} |" >> $GITHUB_STEP_SUMMARY
             echo "| ❌ Errored | ${{ steps.policy-check.outputs.errored }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
 
             if [ "${{ steps.policy-check.outputs.requires_override }}" == "true" ]; then
-              echo "## ⚠️ Override Required" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
-              echo "- Run **2a. Policy Override** workflow (with justification)" >> $GITHUB_STEP_SUMMARY
-              echo "- OR fix the code and re-run **1. Terraform Plan**" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ Override required - Run **2a. Policy Override**" >> $GITHUB_STEP_SUMMARY
             else
-              echo "## ✅ Ready to Apply" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "**Next Step:** Run **3. Terraform Apply** workflow" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Ready - Run **3. Terraform Apply**" >> $GITHUB_STEP_SUMMARY
             fi
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "[View Run in TFC]($RUN_LINK)" >> $GITHUB_STEP_SUMMARY
+          echo "[View Run]($RUN_LINK)" >> $GITHUB_STEP_SUMMARY
