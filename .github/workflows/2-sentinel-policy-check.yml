@@ -118,12 +118,13 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Extract failed policies from JSON
-          # Note: failed_policies is a JSON-encoded string, so we need to parse it first
+          # Extract failed policies summary from description
+          # Note: The description contains the actual count of failed policies
+          # The policy_name field is a generated ID, not the actual policy name
           FAILED_MANDATORY_POLICIES=$(jq -r '
             .failed_policies // "[]" | fromjson |
             if length > 0 then
-              map("- **\(.policy_name)** (\(.enforcement_level))") | join("\n")
+              map("- \(.description)") | join("\n")
             else
               "View detailed policy failures in TFC"
             end

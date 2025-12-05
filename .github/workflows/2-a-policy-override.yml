@@ -27,50 +27,6 @@ jobs:
       final_status: ${{ steps.override.outputs.final_status }}
 
     steps:
-      - name: Verify Run Status
-        id: verify-run
-        run: |
-          echo "🔍 Verifying run is in correct state for override..."
-          echo ""
-
-          RUN_DATA=$(curl -s \
-            --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
-            --header "Content-Type: application/vnd.api+json" \
-            "https://app.terraform.io/api/v2/runs/${{ github.event.inputs.run_id }}")
-
-          CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
-          echo "Current run status: $CURRENT_STATUS"
-          echo ""
-
-          # Verify run is awaiting override
-          if [[ "$CURRENT_STATUS" != "post_plan_awaiting_decision" ]]; then
-            echo "::error::❌ Run is not in the correct state for override"
-            echo "::error::"
-            echo "::error::Current status: $CURRENT_STATUS"
-            echo "::error::Expected status: post_plan_awaiting_decision"
-            echo "::error::"
-
-            case $CURRENT_STATUS in
-              planned|policy_override|post_plan_completed|apply_queued)
-                echo "::error::This run has already been overridden or doesn't need override."
-                echo "::error::Proceed to the Apply workflow (Workflow 3)."
-                ;;
-              applied)
-                echo "::error::This run has already been applied."
-                ;;
-              discarded)
-                echo "::error::This run was discarded and cannot be overridden."
-                ;;
-              *)
-                echo "::error::Cannot override a run in status: $CURRENT_STATUS"
-                ;;
-            esac
-            exit 1
-          fi
-
-          echo "✅ Run is awaiting policy override decision"
-          echo "run_link=https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/runs/${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT
-
       - name: Apply Policy Override
         id: override
         run: |
@@ -79,6 +35,10 @@ jobs:
           echo "Run ID: ${{ github.event.inputs.run_id }}"
           echo "Justification: ${{ github.event.inputs.justification }}"
           echo ""
+
+          # Set run link for summary
+          RUN_LINK="https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/runs/${{ github.event.inputs.run_id }}"
+          echo "run_link=$RUN_LINK" >> $GITHUB_OUTPUT
 
           # Use tfci Docker image to apply policy override
           docker run --rm \
@@ -103,16 +63,18 @@ jobs:
             echo "ready_for_apply=true" >> $GITHUB_OUTPUT
             echo "mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
 
-            # Extract failed policies for summary
-            # Note: failed_policies is a JSON-encoded string, so we need to parse it first
-            FAILED_POLICIES=$(jq -r '
+            # Extract failed policies summary from description
+            # Note: The description contains the actual count of failed policies
+            FAILED_POLICIES_DESC=$(jq -r '
               .failed_policies // "[]" | fromjson |
               if length > 0 then
-                map("- \(.policy_name)") | join("\n")
+                map("- \(.description)") | join("\n")
               else
-                "No specific policy names available"
+                "View detailed policy failures in TFC"
               end
             ' override_output.json)
+
+            FAILED_POLICIES="Mandatory policy failures overridden:\n$FAILED_POLICIES_DESC"
 
             {
               echo "failed_policies<<EOF"
@@ -196,7 +158,7 @@ jobs:
           # Links
           echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- [View Run in TFC](${{ steps.verify-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Run in TFC](${{ steps.override.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
           echo "- [Workspace: ${{ env.TF_WORKSPACE }}](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
