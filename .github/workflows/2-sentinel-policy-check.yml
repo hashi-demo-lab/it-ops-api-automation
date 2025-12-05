@@ -67,6 +67,22 @@ jobs:
           echo "errored=$ERRORED" >> $GITHUB_OUTPUT
           echo "requires_override=$([ "$MANDATORY_FAILED" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
 
+          # Extract failed policy names
+          FAILED_POLICIES=$(jq -r '
+            .failed_policies // "[]" | fromjson |
+            if length > 0 then
+              map("- **\(.policy_name)** (\(.enforcement_level))") | join("\n")
+            else
+              ""
+            end
+          ' policy.json)
+
+          {
+            echo "failed_policies<<EOF"
+            echo "$FAILED_POLICIES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
           cat policy.json
           rm -f policy.json
 
@@ -88,6 +104,13 @@ jobs:
             echo "| 🚫 Mandatory | ${{ steps.policy-check.outputs.mandatory_failed }} |" >> $GITHUB_STEP_SUMMARY
             echo "| ❌ Errored | ${{ steps.policy-check.outputs.errored }} |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Display failed policies if any
+            if [ -n "${{ steps.policy-check.outputs.failed_policies }}" ]; then
+              echo "**Failed Policies:**" >> $GITHUB_STEP_SUMMARY
+              echo "${{ steps.policy-check.outputs.failed_policies }}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
 
             if [ "${{ steps.policy-check.outputs.requires_override }}" == "true" ]; then
               echo "⚠️ Override required - Run **2a. Policy Override**" >> $GITHUB_STEP_SUMMARY
