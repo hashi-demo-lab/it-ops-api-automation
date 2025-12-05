@@ -66,30 +66,35 @@ jobs:
       - name: Get Policy Checks
         id: policy-checks
         run: |
-          # Function: Call TFC API with consistent auth headers
-          tfc_api_call() {
-            local endpoint=$1
-            curl -s \
-              --header "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
-              --header "Content-Type: application/vnd.api+json" \
-              "https://app.terraform.io/api/v2${endpoint}"
-          }
-
           RUN_ID="${{ steps.determine-run.outputs.run_id }}"
 
-          echo "🔍 Retrieving policy evaluation results..."
+          echo "🔍 Retrieving policy evaluation results using tfci..."
           echo ""
 
-          # Get run details
-          RUN_DATA=$(tfc_api_call "/runs/$RUN_ID")
+          # Use tfci Docker image to get policy evaluation
+          docker run --rm \
+            -e TF_API_TOKEN="${{ secrets.TF_API_TOKEN }}" \
+            cloudbrokeraz/tfci:latest \
+            tfci -organization "${{ env.TF_CLOUD_ORGANIZATION }}" \
+            policy show --run "$RUN_ID" --json > policy_output.json
 
-          # Get task stages for this run (includes policy evaluations)
-          TASK_STAGES=$(tfc_api_call "/runs/$RUN_ID/task-stages")
+          # Check if tfci command succeeded
+          if [ $? -ne 0 ]; then
+            echo "policies_enabled=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No Sentinel policies configured for this workspace or error retrieving policies"
+            exit 0
+          fi
 
-          # Check if any policy evaluations exist
-          POLICY_STAGE_ID=$(echo "$TASK_STAGES" | jq -r '.data[] | select(.attributes.stage == "post_plan") | .id' | head -n1)
+          # Parse JSON output from tfci
+          TOTAL=$(jq -r '.total_count // 0' policy_output.json)
+          PASSED=$(jq -r '.passed_count // 0' policy_output.json)
+          ADVISORY_FAILED=$(jq -r '.advisory_failed_count // 0' policy_output.json)
+          MANDATORY_FAILED=$(jq -r '.mandatory_failed_count // 0' policy_output.json)
+          ERRORED=$(jq -r '.errored_count // 0' policy_output.json)
+          REQUIRES_OVERRIDE=$(jq -r '.requires_override // false' policy_output.json)
+          POLICY_STATUS=$(jq -r '.policy_status // "unknown"' policy_output.json)
 
-          if [[ -z "$POLICY_STAGE_ID" || "$POLICY_STAGE_ID" == "null" ]]; then
+          if [ "$TOTAL" -eq 0 ]; then
             echo "policies_enabled=false" >> $GITHUB_OUTPUT
             echo "ℹ️  No Sentinel policies configured for this workspace"
             exit 0
@@ -97,27 +102,13 @@ jobs:
 
           echo "policies_enabled=true" >> $GITHUB_OUTPUT
 
-          # Get policy evaluations for this stage
-          POLICY_EVALS=$(tfc_api_call "/task-stages/$POLICY_STAGE_ID/policy-evaluations")
-
-          # Get the policy evaluation ID for detailed results
-          POLICY_EVAL_ID=$(echo "$POLICY_EVALS" | jq -r '.data[0].id')
-
-          # Count policy results using the correct attribute structure
-          TOTAL=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count" | .passed + ."advisory-failed" + ."mandatory-failed" + .errored] | add // 0')
-          PASSED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count".passed] | add // 0')
-          ADVISORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count"."advisory-failed"] | add // 0')
-          MANDATORY_FAILED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count"."mandatory-failed"] | add // 0')
-          ERRORED=$(echo "$POLICY_EVALS" | jq '[.data[].attributes."result-count".errored] | add // 0')
-
-          # Store detailed policy results for later display
-          echo "policy_eval_id=$POLICY_EVAL_ID" >> $GITHUB_OUTPUT
-          echo "policy_stage_id=$POLICY_STAGE_ID" >> $GITHUB_OUTPUT
+          # Store policy results
           echo "policy_count=$TOTAL" >> $GITHUB_OUTPUT
           echo "policies_passed=$PASSED" >> $GITHUB_OUTPUT
           echo "policies_advisory_failed=$ADVISORY_FAILED" >> $GITHUB_OUTPUT
           echo "policies_mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
           echo "policies_errored=$ERRORED" >> $GITHUB_OUTPUT
+          echo "policy_status=$POLICY_STATUS" >> $GITHUB_OUTPUT
 
           echo "📊 Policy Evaluation Summary:"
           echo "   Total Policies: $TOTAL"
@@ -127,54 +118,32 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Fetch individual policy outcomes with failure details
-          if [[ -n "$POLICY_EVAL_ID" && "$POLICY_EVAL_ID" != "null" ]]; then
-            echo "🔍 Fetching detailed policy set outcomes..."
-            echo "Policy Eval ID: $POLICY_EVAL_ID"
+          # Extract failed policies from JSON
+          FAILED_MANDATORY_POLICIES=$(jq -r '
+            .failed_policies // [] |
+            if length > 0 then
+              map("- **\(.policy_name)** (\(.enforcement_level))") | join("\n")
+            else
+              "View detailed policy failures in TFC"
+            end
+          ' policy_output.json)
 
-            # Get policy set outcomes - individual policies are nested in .data[].attributes.outcomes[]
-            POLICY_SET_OUTCOMES=$(tfc_api_call "/policy-evaluations/$POLICY_EVAL_ID/policy-set-outcomes")
+          # Save failed policies to output
+          {
+            echo "failed_mandatory_policies<<EOF"
+            echo "$FAILED_MANDATORY_POLICIES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
-            # Extract failed mandatory policies from the nested outcomes array
-            FAILED_MANDATORY_POLICIES=$(echo "$POLICY_SET_OUTCOMES" | jq -r '
-              if (.data != null and (.data | length) > 0) then
-                [.data[].attributes.outcomes[] |
-                  select(.status == "failed") |
-                  select(.enforcement_level == "mandatory") |
-                  "- **\(.policy_name)** (mandatory)"
-                ] |
-                if length > 0 then
-                  join("\n")
-                else
-                  "Mandatory policies failed but no details found in API response"
-                end
-              else
-                "No policy outcome data available from API - view in TFC for details"
-              end
-            ')
-
-            # Save failed policies to output
-            {
-              echo "failed_mandatory_policies<<EOF"
-              echo "$FAILED_MANDATORY_POLICIES"
-              echo "EOF"
-            } >> $GITHUB_OUTPUT
-
+          if [ "$MANDATORY_FAILED" -gt 0 ]; then
             echo ""
             echo "🚫 Failed Mandatory Policies:"
             echo "$FAILED_MANDATORY_POLICIES"
             echo ""
-          else
-            # No policy details to fetch
-            {
-              echo "failed_mandatory_policies<<EOF"
-              echo "View detailed policy failures in TFC"
-              echo "EOF"
-            } >> $GITHUB_OUTPUT
           fi
 
-          # Save placeholder for summary (TFC link will be provided)
-          echo "policy_details=View detailed policy results in TFC" >> $GITHUB_OUTPUT
+          # Clean up
+          rm -f policy_output.json
 
       - name: Check if Override Required
         id: policy-override
