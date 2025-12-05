@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'TFC Run ID to check policies for'
+        description: "TFC Run ID to check policies for"
         required: true
         type: string
   workflow_run:
@@ -118,13 +118,42 @@ jobs:
           echo "   ❌ Errored: $ERRORED"
           echo ""
 
-          # Extract failed policies summary from description
-          # Note: The description contains the actual count of failed policies
-          # The policy_name field is a generated ID, not the actual policy name
+          # Extract failed policies with descriptions from policy_details (raw API response)
+          # This contains the complete TFC API response with all policy information
           FAILED_MANDATORY_POLICIES=$(jq -r '
-            .failed_policies // "[]" | fromjson |
-            if length > 0 then
-              map("- \(.description)") | join("\n")
+            if .policy_details then
+              .policy_details |
+              if .data and .data.attributes and .data.attributes."policy-set-outcomes" then
+                .data.attributes."policy-set-outcomes" |
+                map(
+                  select(.outcomes."mandatory-failed" > 0) |
+                  if .description != "" and .description != null then
+                    "- \(.description) (\(.outcomes."mandatory-failed") failed)"
+                  elif ."policy-set-name" != "" and ."policy-set-name" != null then
+                    "- \(."policy-set-name") (\(.outcomes."mandatory-failed") mandatory policy failures)"
+                  else
+                    "- Policy set with \(.outcomes."mandatory-failed") mandatory failures"
+                  end
+                ) | join("\n")
+              else
+                "View detailed policy failures in TFC"
+              end
+            elif .failed_policies then
+              # Fallback to failed_policies if policy_details not available
+              .failed_policies | 
+              if length > 0 then
+                map(
+                  if .description != "" and .description != null then
+                    "- \(.description)"
+                  elif .policy_name != "" and .policy_name != null then
+                    "- \(.policy_name) (\(.enforcement_level))"
+                  else
+                    "- Policy failed (\(.enforcement_level))"
+                  end
+                ) | join("\n")
+              else
+                "View detailed policy failures in TFC"
+              end
             else
               "View detailed policy failures in TFC"
             end
