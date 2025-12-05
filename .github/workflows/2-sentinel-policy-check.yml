@@ -67,19 +67,12 @@ jobs:
           echo "errored=$ERRORED" >> $GITHUB_OUTPUT
           echo "requires_override=$([ "$MANDATORY_FAILED" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
 
-          # Extract failed policy names
-          FAILED_POLICIES=$(jq -r '
-            .failed_policies // "[]" | fromjson |
-            if length > 0 then
-              map("- **\(.policy_name)** (\(.enforcement_level))") | join("\n")
-            else
-              ""
-            end
-          ' policy.json)
+          # Extract pre-formatted markdown (already formatted by tfci)
+          FAILED_POLICIES_MD=$(jq -r '.failed_policies_markdown // ""' policy.json)
 
           {
             echo "failed_policies<<EOF"
-            echo "$FAILED_POLICIES"
+            echo "$FAILED_POLICIES_MD"
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
