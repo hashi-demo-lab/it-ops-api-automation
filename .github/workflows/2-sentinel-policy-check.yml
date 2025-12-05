@@ -122,31 +122,9 @@ jobs:
           # Clean up
           rm -f policy_output.json
 
-      - name: Check if Override Required
-        id: policy-override
+      - name: Display Policy Details
+        if: steps.policy-checks.outputs.policies_enabled == 'true'
         run: |
-          if [ "${{ steps.policy-checks.outputs.policies_mandatory_failed }}" != "0" ]; then
-            echo "requires_override=true" >> $GITHUB_OUTPUT
-            echo ""
-            echo "⚠️  MANDATORY POLICIES FAILED - OVERRIDE REQUIRED"
-            echo ""
-            echo "Next Steps:"
-            echo "  1. Review detailed policy output in TFC: ${{ steps.determine-run.outputs.run_link }}"
-            echo "  2. If override is justified, run the '2a. Policy Override' workflow"
-            echo "  3. Otherwise, fix the code and create a new plan"
-            echo ""
-          else
-            echo "requires_override=false" >> $GITHUB_OUTPUT
-            echo "✅ All policies passed or only advisory failures"
-            echo "Proceed to Apply workflow (Workflow 3)"
-          fi
-
-      - name: Policy Review Complete
-        if: steps.policy-override.outputs.requires_override == 'true'
-        run: |
-          echo "::warning::⚠️  Mandatory policy failures detected"
-          echo "::warning::"
-          echo "::warning::Next steps:"
-          echo "::warning::  1. Review detailed output in TFC: ${{ steps.determine-run.outputs.run_link }}"
-          echo "::warning::  2. Run '2a. Policy Override' workflow to override if justified"
-          echo "::warning::  3. OR fix the code and create a new plan (Workflow 1)"
+          echo "📋 Policy Details (Raw TFC API Response):"
+          echo ""
+          echo '${{ steps.policy-checks.outputs.policy_details }}' | jq '.'
