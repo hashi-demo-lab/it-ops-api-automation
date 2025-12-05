@@ -104,8 +104,9 @@ jobs:
             echo "mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
 
             # Extract failed policies for summary
+            # Note: failed_policies is a JSON-encoded string, so we need to parse it first
             FAILED_POLICIES=$(jq -r '
-              .failed_policies // [] |
+              .failed_policies // "[]" | fromjson |
               if length > 0 then
                 map("- \(.policy_name)") | join("\n")
               else
