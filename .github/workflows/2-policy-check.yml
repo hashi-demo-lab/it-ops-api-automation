@@ -53,26 +53,18 @@ jobs:
             tfci -organization "${{ env.TF_CLOUD_ORGANIZATION }}" \
             policy show --run "${{ steps.determine-run.outputs.run_id }}" --json > policy.json
 
-          # Extract key details
-          TOTAL=$(jq -r '.total_count // 0' policy.json)
-          PASSED=$(jq -r '.passed_count // 0' policy.json)
-          ADVISORY_FAILED=$(jq -r '.advisory_failed_count // 0' policy.json)
-          MANDATORY_FAILED=$(jq -r '.mandatory_failed_count // 0' policy.json)
-          ERRORED=$(jq -r '.errored_count // 0' policy.json)
+          # Extract outputs (all provided by tfci)
+          echo "total=$(jq -r '.total_count // 0' policy.json)" >> $GITHUB_OUTPUT
+          echo "passed=$(jq -r '.passed_count // 0' policy.json)" >> $GITHUB_OUTPUT
+          echo "advisory_failed=$(jq -r '.advisory_failed_count // 0' policy.json)" >> $GITHUB_OUTPUT
+          echo "mandatory_failed=$(jq -r '.mandatory_failed_count // 0' policy.json)" >> $GITHUB_OUTPUT
+          echo "errored=$(jq -r '.errored_count // 0' policy.json)" >> $GITHUB_OUTPUT
+          echo "requires_override=$(jq -r '.requires_override // false' policy.json)" >> $GITHUB_OUTPUT
 
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "passed=$PASSED" >> $GITHUB_OUTPUT
-          echo "advisory_failed=$ADVISORY_FAILED" >> $GITHUB_OUTPUT
-          echo "mandatory_failed=$MANDATORY_FAILED" >> $GITHUB_OUTPUT
-          echo "errored=$ERRORED" >> $GITHUB_OUTPUT
-          echo "requires_override=$([ "$MANDATORY_FAILED" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
-
-          # Extract pre-formatted list (already formatted by tfci)
-          FAILED_POLICIES_LIST=$(jq -r '.failed_policies_list // ""' policy.json)
-
+          # Extract pre-formatted failed policies list
           {
             echo "failed_policies<<EOF"
-            echo "$FAILED_POLICIES_LIST"
+            jq -r '.failed_policies_list // ""' policy.json
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
